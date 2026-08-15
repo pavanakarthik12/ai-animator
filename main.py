@@ -4,6 +4,14 @@ from config import config
 from mcp_client import KritaMCPClient
 from groq_agent import GroqAgent
 
+# Windows consoles may use cp1252; force UTF-8 with lossless replacement so
+# printing tool results (which may contain unicode) never crashes.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def main():
     try:
@@ -50,16 +58,28 @@ def main():
             tool_summaries.append(summary)
 
         system_message = (
-            "You are controlling Krita through MCP. Complete the user's requested drawing using the available Krita tools. "
-            "Changing a setting such as color or brush is only an intermediate step. Continue making tool calls until the requested artwork has actually been drawn. "
-            "After each tool result, reassess whether the user's request is complete. Never stop merely because an intermediate tool succeeded.\n"
+            "You are controlling Krita through MCP. Complete the user's requested artwork inside Krita by CALLING the available tools. "
+            "Never describe performing an operation in text — invoke the tool. "
+            "Changing a setting such as color or brush is only an intermediate step. "
+            "Continue making tool calls until the requested artwork has actually been created in Krita, then return a plain natural-language summary.\n"
             f"Available tools: {', '.join(tool_summaries)}.\n"
-            "If the user requests a multi-stroke drawing, prefer returning a single `krita_batch_draw` tool_call containing the color, brush_size, and an array of strokes (each with points). This lets the agent send many strokes in one MCP batch.\n"
-            "For simple frame-by-frame animation tasks, you may use these animation helpers: `krita_create_frame(name)`, `krita_select_frame(index)`, `krita_get_current_frame()`, `krita_enable_onion(enabled)`, and `krita_inspect_previous_frame(downscale)`.\n"
-            "Typical animation sequence: call `krita_create_frame` then `krita_select_frame` to work on frame N, draw using `krita_batch_draw`, then `krita_create_frame`/`krita_select_frame` for next frame, enable onion skin with `krita_enable_onion(true)`, inspect previous frame with `krita_inspect_previous_frame`, then draw on the new frame.\n"
-            "When invoking a tool, output ONLY a JSON object with keys 'tool' (string) and 'args' (object).\n"
-            "When finished, return a plain natural-language message (not JSON).\n"
-            "Example tool call: {\"tool\": \"krita_batch_draw\", \"args\": {\"color\": \"#ff0000\", \"brush_size\": 6, \"strokes\": [{\"points\": [[100,100],[120,120]]}]}}"
+            "If the user requests a multi-stroke drawing, prefer returning a single `krita_batch_draw` tool_call containing the color, "
+            "brush_size, and an array of strokes (each with points). This lets the agent send many strokes in one MCP batch.\n"
+            "ANIMATION RULES:\n"
+            "- When the user asks you to create, modify, or animate frames, you MUST use the animation/keyframe tools "
+            "(krita_select_paint_layer, krita_create_keyframe, krita_set_current_frame, krita_get_current_frame, "
+            "krita_list_keyframes, krita_has_keyframe, krita_delete_keyframe) together with the drawing tools.\n"
+            "- A frame is a REAL timeline keyframe on the active paint layer. Do not fake frames with layers, files, or text claims.\n"
+            "- Never claim that a frame, keyframe, or drawing was created unless the corresponding MCP tool was actually executed and "
+            "returned success.\n"
+            "- For a two-frame task, use this strict order: `krita_select_paint_layer` -> `krita_create_keyframe(frame=0)` -> "
+            "`krita_set_current_frame(frame=0)` -> verify with `krita_get_current_frame` / `krita_has_keyframe` / `krita_list_keyframes` "
+            "-> draw frame 0; then `krita_create_keyframe(frame=1)` -> `krita_set_current_frame(frame=1)` -> verify keyframes include "
+            "both 0 and 1 -> draw frame 1.\n"
+            "- After each frame operation, verify the state and include that evidence (current frame and keyframe list) in your final response.\n"
+            "Example animation flow: krita_select_paint_layer -> krita_create_keyframe(frame=0) -> krita_set_current_frame(frame=0) -> "
+            "krita_batch_draw / krita_stroke -> krita_create_keyframe(frame=1) -> krita_set_current_frame(frame=1) -> draw -> "
+            "krita_list_keyframes to verify.\n"
         )
 
         messages = [
@@ -108,10 +128,32 @@ def main():
             },
         })
 
+        print("Groq tools available (passed in `tools`):")
+        for tf in tools_for_model:
+            fn = tf.get("function", {})
+            print("  -", fn.get("name"))
+        print("Model name:", config.groq_model)
+
         import json
+
+        # Classify the request so we can gate the final response on actual tool use.
+        prompt_lower = prompt.lower()
+        wants_drawing = any(k in prompt_lower for k in (
+            "draw", "circle", "ellipse", "paint", "stroke", "shape", "stick", "man", "scene", "art",
+        ))
+        wants_animation = any(k in prompt_lower for k in (
+            "frame", "frames", "animation", "animate", "animating", "keyframe", "keyframes",
+            "wave", "waving", "timeline",
+        ))
+        wants_multiple_frames = any(k in prompt_lower for k in (
+            "two", " 2 ", "2 frames", "second frame", "frame 0", "frame 1", "each frame", "both frames",
+        ))
 
         max_steps = 20
         executed_drawing = False
+        executed_frame_ops = False
+        create_keyframe_count = 0
+        follow_ups = 0
         for step in range(max_steps):
             print("Sending request to Groq (step", step + 1, ")...")
             import time
@@ -217,6 +259,8 @@ def main():
                                 try:
                                     r = mcp.call_tool("krita_stroke", {"points": points, "pressure": pressure}, timeout=60)
                                     batch_results.append({"action": "krita_stroke", "result": r})
+                                    if "error" not in str(r).lower():
+                                        executed_drawing = True
                                 except Exception as e:
                                     print("MCP call failed:", e)
                                     traceback.print_exc()
@@ -245,9 +289,22 @@ def main():
                         traceback.print_exc()
                         return
 
+                    # Only count operations as performed if the tool actually succeeded
+                    res_ok = "error" not in str(res).lower()
+
                     # Mark drawing executed if applicable
-                    if fn_name in ("krita_draw_shape", "krita_stroke", "krita_fill"):
+                    if fn_name in ("krita_draw_shape", "krita_stroke", "krita_fill") and res_ok:
                         executed_drawing = True
+
+                    # Mark animation/frame operations executed
+                    if fn_name in (
+                        "krita_create_keyframe", "krita_set_current_frame", "krita_select_frame",
+                        "krita_create_frame", "krita_get_current_frame", "krita_list_keyframes",
+                        "krita_has_keyframe", "krita_delete_keyframe",
+                    ) and res_ok:
+                        executed_frame_ops = True
+                        if fn_name in ("krita_create_keyframe", "krita_create_frame"):
+                            create_keyframe_count += 1
 
                     # Append the tool result with matching tool_call_id
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": str(res)})
@@ -259,17 +316,45 @@ def main():
                 # After executing all tool calls, continue loop so model can respond
                 continue
 
-            # No tool calls — treat as final natural-language reply
-            # If the user requested a drawing but no drawing tools were executed, prompt the model to continue (no fallback drawing)
-            user_requested_draw = any(k in prompt.lower() for k in ("draw", "circle", "ellipse", "paint", "stroke"))
-            if user_requested_draw and not executed_drawing:
-                print("Model returned final text but no drawing performed. Prompting model to finish the drawing.")
-                followup = (
-                    "You returned a natural-language response but the user's drawing request has not been completed because no drawing tool was used. "
-                    "Please respond with a JSON tool call to perform the actual drawing (use krita_draw_shape or krita_stroke)."
-                )
+            # No tool calls — the model produced plain text.
+            print("message.tool_calls:", "EMPTY/None" if not tool_calls else f"{len(tool_calls)} call(s)")
+
+            # Determine whether the requested operation has actually been performed
+            # using tools. Do NOT accept a final text response for animation/drawing
+            # requests unless the required tools were executed (phase.md §5).
+            missing_work = False
+            if wants_animation:
+                if not executed_frame_ops:
+                    missing_work = True
+                if wants_multiple_frames and create_keyframe_count < 2:
+                    missing_work = True
+                if wants_drawing and not executed_drawing:
+                    missing_work = True
+            elif wants_drawing and not executed_drawing:
+                missing_work = True
+
+            if missing_work and follow_ups < 5:
+                follow_ups += 1
+                print("Model returned final text but the requested operation was not performed with tools. Prompting the model to use the tools.")
+                if wants_animation:
+                    followup = (
+                        "You returned a natural-language response, but the user's animation request has not been completed: "
+                        "no animation/frame tools were actually executed" + (" and no drawing was performed" if wants_drawing and not executed_drawing else "") + ". "
+                        "You MUST use the Krita MCP tools to perform the work: "
+                        "`krita_select_paint_layer`, `krita_create_keyframe(frame=...)`, `krita_set_current_frame(frame=...)`, "
+                        "verify with `krita_get_current_frame`/`krita_list_keyframes`, and draw with `krita_batch_draw`/`krita_stroke`/`krita_draw_shape`. "
+                        "Only after the tools have succeeded, summarize what was created."
+                    )
+                else:
+                    followup = (
+                        "You returned a natural-language response but the user's drawing request has not been completed because no drawing tool was used. "
+                        "Please invoke a drawing tool call (krita_batch_draw, krita_stroke or krita_draw_shape) to perform the actual drawing."
+                    )
                 messages.append({"role": "user", "content": followup})
                 continue
+
+            if follow_ups >= 5:
+                print("Too many follow-ups without tool use; accepting response.")
 
             print("Final assistant response:")
             if isinstance(model_text, dict):
@@ -277,6 +362,9 @@ def main():
             else:
                 print(model_text)
             break
+
+        else:
+            print("Max steps reached without completion.")
 
     except Exception as e:
         print("Fatal error:", e)

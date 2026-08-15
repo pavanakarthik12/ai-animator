@@ -22,7 +22,7 @@ class GroqAgent:
             "model": self.model,
             "disable_tool_validation": True,
             "tool_choice": "auto",
-            "max_completion_tokens": 512,
+            "max_completion_tokens": 1024,
         }
 
         if tools:
