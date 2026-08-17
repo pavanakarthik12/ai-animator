@@ -89,12 +89,54 @@ def main():
 
         # Convert MCP tools into Groq `tools` function definitions so the model
         # can call them with structured inputs.
+        #
+        # Schema compression: MCP schemas contain bloated constructs (nullable
+        # `anyOf` variants, `additionalProperties`) that inflate the Groq
+        # request to thousands of tokens and trigger 429 TPM rate limits on
+        # multi-step runs. Strip them before sending to Groq.
+        def sanitize_schema(schema):
+            if isinstance(schema, dict):
+                out = {}
+                for k, v in schema.items():
+                    if k == "additionalProperties":
+                        continue
+                    if k == "anyOf" and isinstance(v, list):
+                        non_null = [x for x in v if not (isinstance(x, dict) and x.get("type") == "null")]
+                        if len(non_null) == 1:
+                            out.update(sanitize_schema(non_null[0]))
+                            continue
+                        out[k] = [sanitize_schema(x) for x in non_null]
+                        continue
+                    if k == "properties" and isinstance(v, dict):
+                        out[k] = {pk: sanitize_schema(pv) for pk, pv in v.items()}
+                        continue
+                    if k == "items" and isinstance(v, dict):
+                        out[k] = sanitize_schema(v)
+                        continue
+                    out[k] = v
+                return out
+            return schema
+
+        # Only expose tools relevant to drawing/animation tasks. This keeps the
+        # Groq `tools` payload small enough to stay under the TPM rate limit
+        # across the many requests a two-frame animation requires.
+        tool_subset = {
+            "krita_new_canvas", "krita_set_color", "krita_set_brush",
+            "krita_stroke", "krita_fill", "krita_draw_shape", "krita_get_canvas",
+            "krita_select_paint_layer", "krita_create_frame", "krita_select_frame",
+            "krita_get_current_frame", "krita_set_current_frame",
+            "krita_create_keyframe", "krita_delete_keyframe",
+            "krita_list_keyframes", "krita_has_keyframe",
+        }
+
         tools_for_model = []
         for t in tools_detailed:
             name = t.get("name")
+            if name not in tool_subset:
+                continue
             desc = t.get("description") or f"MCP tool {name}"
             params_schema = t.get("input_schema") or {"type": "object", "properties": {}}
-            func = {"name": name, "description": desc, "parameters": params_schema}
+            func = {"name": name, "description": desc, "parameters": sanitize_schema(params_schema)}
             tools_for_model.append({"type": "function", "function": func})
 
         # Add an agent-side batch drawing helper so the model can return one tool call
@@ -153,6 +195,8 @@ def main():
         executed_drawing = False
         executed_frame_ops = False
         create_keyframe_count = 0
+        last_draw_step = -1
+        last_keyframe_step = -1
         follow_ups = 0
         for step in range(max_steps):
             print("Sending request to Groq (step", step + 1, ")...")
@@ -271,6 +315,7 @@ def main():
                         # mark executed drawing if any strokes present
                         if strokes:
                             executed_drawing = True
+                            last_draw_step = step
                         continue
 
                     # Parse arguments if they're a JSON string
@@ -295,6 +340,7 @@ def main():
                     # Mark drawing executed if applicable
                     if fn_name in ("krita_draw_shape", "krita_stroke", "krita_fill") and res_ok:
                         executed_drawing = True
+                        last_draw_step = step
 
                     # Mark animation/frame operations executed
                     if fn_name in (
@@ -305,6 +351,7 @@ def main():
                         executed_frame_ops = True
                         if fn_name in ("krita_create_keyframe", "krita_create_frame"):
                             create_keyframe_count += 1
+                            last_keyframe_step = step
 
                     # Append the tool result with matching tool_call_id
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": str(res)})
@@ -330,8 +377,18 @@ def main():
                     missing_work = True
                 if wants_drawing and not executed_drawing:
                     missing_work = True
+                # A multi-frame drawing must have actual drawing AFTER the last
+                # keyframe was created; drawing only on earlier frames is not
+                # enough (the model often stops right after create_keyframe).
+                if wants_multiple_frames and not missing_work and last_keyframe_step > last_draw_step:
+                    missing_work = True
             elif wants_drawing and not executed_drawing:
                 missing_work = True
+
+            # An empty final response is never acceptable for a work request.
+            if not missing_work and (wants_drawing or wants_animation):
+                if not (model_text and str(model_text).strip()):
+                    missing_work = True
 
             if missing_work and follow_ups < 5:
                 follow_ups += 1
@@ -343,6 +400,8 @@ def main():
                         "You MUST use the Krita MCP tools to perform the work: "
                         "`krita_select_paint_layer`, `krita_create_keyframe(frame=...)`, `krita_set_current_frame(frame=...)`, "
                         "verify with `krita_get_current_frame`/`krita_list_keyframes`, and draw with `krita_batch_draw`/`krita_stroke`/`krita_draw_shape`. "
+                        "If the frames already exist but the last-created frame has nothing drawn on it, switch to it with "
+                        "`krita_set_current_frame(frame=N)` and draw there before summarizing. "
                         "Only after the tools have succeeded, summarize what was created."
                     )
                 else:
