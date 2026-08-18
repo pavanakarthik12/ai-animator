@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import threading
 from typing import Any, List
@@ -27,7 +28,9 @@ class KritaMCPClient:
         asyncio.set_event_loop(self._loop)
 
         async def _startup():
-            transport = PythonStdioTransport(self.server_py_path)
+            # The MCP stdio client builds a minimal environment when env is
+            # None, so pass the parent env explicitly (KRITA_URL et al).
+            transport = PythonStdioTransport(self.server_py_path, env=os.environ.copy())
             self._client = FastMCPClient(transport, name="groq-krita-agent")
             # Enter async context to initialize the client/session
             await self._client.__aenter__()

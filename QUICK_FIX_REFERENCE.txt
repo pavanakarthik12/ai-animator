@@ -1,0 +1,110 @@
+================================================================================
+                    IMAGE REFERENCE DRAWING - QUICK REFERENCE
+================================================================================
+
+✅ ALL FIXES APPLIED - READY TO USE
+
+--------------------------------------------------------------------------------
+WHAT WAS FIXED
+--------------------------------------------------------------------------------
+1. Vision model updated: llama-3.2-90b-vision-preview → qwen/qwen3.6-27b
+2. JSON mode enabled to prevent thinking tags
+3. JSON extraction improved (handles <think> tags + trailing commas)
+4. Error handling improved
+
+--------------------------------------------------------------------------------
+CURRENT CONFIGURATION (.env)
+--------------------------------------------------------------------------------
+GROQ_API_KEY=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
+GROQ_MODEL=openai/gpt-oss-120b
+GROQ_VISION_MODEL=qwen/qwen3.6-27b    ← UPDATED
+KRITA_MCP_SERVER=C:\Users\pavan\OneDrive\Desktop\krita-mcp\server.py
+KRITA_URL=http://127.0.0.1:5678
+
+--------------------------------------------------------------------------------
+HOW TO USE
+--------------------------------------------------------------------------------
+
+Option 1 - Your Screenshot:
+  python test_reference_drawing.py "C:\Users\pavan\OneDrive\Pictures\Screenshots 1\Screenshot 2026-08-18 115136.png"
+
+Option 2 - Test Images:
+  python create_test_image.py
+  python test_reference_drawing.py test_simple_character.png
+
+Option 3 - Interactive:
+  python main.py
+  [Enter image path when prompted]
+
+Option 4 - Custom Prompt:
+  python test_reference_drawing.py path/to/image.png "Your custom prompt"
+
+--------------------------------------------------------------------------------
+EXPECTED WORKFLOW
+--------------------------------------------------------------------------------
+1. Reference image loaded
+2. Sent to Groq Vision (qwen/qwen3.6-27b)
+3. Vision analysis (JSON format with drawing plan)
+4. Convert to drawing batches (grouped by color)
+5. Execute via MCP → Krita
+6. Check Krita canvas for result
+
+--------------------------------------------------------------------------------
+TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+"KRITA_MCP_SERVER not set"
+  → Edit .env and set the path
+
+"Missing GROQ_API_KEY"
+  → Add your API key to .env
+
+"Image file not found"
+  → Check the path is correct
+  → Use absolute path or relative to project folder
+
+"Connection refused"
+  → Make sure Krita is running
+  → Check KRITA_URL in .env
+
+"No valid JSON"
+  → JSON mode should prevent this now
+  → If persists, check GROQ_VISION_MODEL is set to qwen/qwen3.6-27b
+
+--------------------------------------------------------------------------------
+VERIFICATION
+--------------------------------------------------------------------------------
+Run this to verify everything is configured:
+  python -c "from config import config; print('Vision model:', config.groq_vision_model)"
+
+Expected output:
+  Vision model: qwen/qwen3.6-27b
+
+--------------------------------------------------------------------------------
+FILES MODIFIED
+--------------------------------------------------------------------------------
+Core:
+  - config.py (vision model default)
+  - groq_agent.py (JSON mode + model update)
+  - vision_to_drawing.py (improved JSON extraction)
+  - main.py (better error handling)
+  - .env (updated configuration)
+
+Tests:
+  - test_json_extraction.py (new - tests JSON parsing)
+  - test_vision_module.py (existing - all tests pass)
+
+Docs:
+  - HOTFIX_VISION_MODEL.md (explains model fix)
+  - HOTFIX_JSON_MODE.md (explains JSON fix)
+  - FIXES_APPLIED.md (complete summary)
+  - This file (quick reference)
+
+--------------------------------------------------------------------------------
+STATUS: ✅ READY
+--------------------------------------------------------------------------------
+All critical bugs fixed.
+Image reference drawing is ready for testing.
+
+Try it now with your screenshot!
+================================================================================

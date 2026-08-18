@@ -1,8 +1,13 @@
 import sys
 import traceback
+import time
+import os
+import json
+from pathlib import Path
 from config import config
 from mcp_client import KritaMCPClient
 from groq_agent import GroqAgent
+from vision_to_drawing import vision_plan_to_drawing_batches, create_drawing_plan_prompt
 
 # Windows consoles may use cp1252; force UTF-8 with lossless replacement so
 # printing tool results (which may contain unicode) never crashes.
@@ -11,6 +16,37 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+
+def _extract_points(stroke):
+    """Coerce a batch stroke argument into a list of [x, y] integer pairs.
+
+    Accepts {"points": [[x, y], ...]}, [[x, y], ...], or a flat
+    [x1, y1, x2, y2, ...] list, so slightly malformed model output still
+    executes instead of failing the whole batch.
+    """
+    if isinstance(stroke, dict):
+        points = stroke.get("points")
+    else:
+        points = stroke
+    if not isinstance(points, list) or not points:
+        return []
+    if all(isinstance(p, (list, tuple)) for p in points):
+        out = []
+        for p in points:
+            if len(p) >= 2:
+                try:
+                    out.append([int(p[0]), int(p[1])])
+                except Exception:
+                    pass
+        return out
+    flat = []
+    for v in points:
+        try:
+            flat.append(int(v))
+        except Exception:
+            pass
+    return [[flat[i], flat[i + 1]] for i in range(0, len(flat) - 1, 2)]
 
 
 def main():
@@ -39,32 +75,78 @@ def main():
             print("Missing GROQ_API_KEY in environment (.env). Exiting.")
             return
 
-        agent = GroqAgent(config.groq_api_key, config.groq_model)
+        agent = GroqAgent(config.groq_api_key, config.groq_model, config.groq_vision_model)
 
-        import os
-        # Allow non-interactive testing via AUTOMATION_PROMPT env var
+        # Check for image reference input
+        reference_image_path = os.environ.get("REFERENCE_IMAGE")
         prompt = os.environ.get("AUTOMATION_PROMPT")
+        
+        # Interactive mode: check for image path first
+        if not prompt and not reference_image_path:
+            print("\n=== Groq + Krita Drawing Agent ===")
+            print("Mode 1: Text-only drawing - just type your request")
+            print("Mode 2: Image reference - provide image path first")
+            print()
+            
+            image_input = input("Image path (or press Enter to skip): ").strip()
+            if image_input and os.path.exists(image_input):
+                reference_image_path = image_input
+                prompt = input("What should I draw based on this reference?\n> ").strip()
+                if not prompt:
+                    prompt = "Recreate this reference image in Krita as accurately as possible."
+            else:
+                if image_input:
+                    print(f"Image not found: {image_input}")
+                prompt = input("What should I draw in Krita?\n> ").strip()
+        
         if not prompt:
-            prompt = input("What should I draw in Krita?\n> ")
+            print("No prompt provided.")
+            return
+
+        # Expose only planning-level tools to the model. The per-stroke MCP
+        # tools (krita_set_color, krita_set_brush, krita_stroke, krita_fill,
+        # krita_draw_shape) are NOT passed to Groq — they are still executed
+        # via MCP, but only through the agent-side `krita_batch_draw` wrapper,
+        # so the model cannot fall back to one request per stroke.
+        tool_subset = {
+            "krita_new_canvas",
+            "krita_select_paint_layer",
+            "krita_create_frame", "krita_select_frame",
+            "krita_get_current_frame", "krita_set_current_frame",
+            "krita_create_keyframe", "krita_delete_keyframe",
+            "krita_list_keyframes", "krita_has_keyframe",
+        }
 
         # System prompt: be explicit about completing the user's drawing by using MCP tools.
-        # Include discovered tool schemas to help the model choose correct arguments.
+        # Only summarize the tools actually exposed to the model (names + one-line
+        # descriptions). Dumping full MCP schemas here inflates the Groq request
+        # past the org TPM limit.
         tool_summaries = []
         for t in tools_detailed:
-            summary = t.get("name")
-            schema = t.get("input_schema")
-            if schema:
-                summary += f" schema={schema}"
-            tool_summaries.append(summary)
+            name = t.get("name")
+            if name not in tool_subset:
+                continue
+            desc = (t.get("description") or "").strip().split("\n")[0]
+            tool_summaries.append(f"{name} — {desc}")
+        tool_summaries.append(
+            "krita_batch_draw — draw a COMPLETE drawing in one call (color, brush_size, strokes array of point lists)"
+        )
 
         system_message = (
             "You are controlling Krita through MCP. Complete the user's requested artwork inside Krita by CALLING the available tools. "
             "Never describe performing an operation in text — invoke the tool. "
-            "Changing a setting such as color or brush is only an intermediate step. "
-            "Continue making tool calls until the requested artwork has actually been created in Krita, then return a plain natural-language summary.\n"
+            "Changing a setting such as color or brush is only an intermediate step.\n"
+            "PLANNING RULE (most important): Plan the COMPLETE drawing before executing anything. "
+            "For any drawing request, your FIRST tool-calling response must contain the entire drawing as ONE `krita_batch_draw` "
+            "call with the color, brush_size, and an array of strokes (each stroke is an object with a `points` array of [x, y] pairs). "
+            "Do NOT draw stroke by stroke with separate requests — the whole drawing must be planned and emitted in a single response. "
+            "If the drawing needs more than one color, emit one `krita_batch_draw` call per color IN THE SAME response; do not wait "
+            "for a reply between colors. "
+            "Every `krita_batch_draw` call MUST include `complete`: set it to `true` ONLY in the LAST batch, once the ENTIRE requested "
+            "drawing (all colors, all parts) has been drawn in that response; set it to `false` when more drawing will follow. "
+            "The request is considered finished when a `krita_batch_draw` with `complete=true` executes successfully.\n"
+            "The Krita canvas is 800x600 pixels by default: x ranges 0-799, y ranges 0-599.\n"
             f"Available tools: {', '.join(tool_summaries)}.\n"
-            "If the user requests a multi-stroke drawing, prefer returning a single `krita_batch_draw` tool_call containing the color, "
-            "brush_size, and an array of strokes (each with points). This lets the agent send many strokes in one MCP batch.\n"
             "ANIMATION RULES:\n"
             "- When the user asks you to create, modify, or animate frames, you MUST use the animation/keyframe tools "
             "(krita_select_paint_layer, krita_create_keyframe, krita_set_current_frame, krita_get_current_frame, "
@@ -78,7 +160,7 @@ def main():
             "both 0 and 1 -> draw frame 1.\n"
             "- After each frame operation, verify the state and include that evidence (current frame and keyframe list) in your final response.\n"
             "Example animation flow: krita_select_paint_layer -> krita_create_keyframe(frame=0) -> krita_set_current_frame(frame=0) -> "
-            "krita_batch_draw / krita_stroke -> krita_create_keyframe(frame=1) -> krita_set_current_frame(frame=1) -> draw -> "
+            "krita_batch_draw -> krita_create_keyframe(frame=1) -> krita_set_current_frame(frame=1) -> draw -> "
             "krita_list_keyframes to verify.\n"
         )
 
@@ -117,18 +199,6 @@ def main():
                 return out
             return schema
 
-        # Only expose tools relevant to drawing/animation tasks. This keeps the
-        # Groq `tools` payload small enough to stay under the TPM rate limit
-        # across the many requests a two-frame animation requires.
-        tool_subset = {
-            "krita_new_canvas", "krita_set_color", "krita_set_brush",
-            "krita_stroke", "krita_fill", "krita_draw_shape", "krita_get_canvas",
-            "krita_select_paint_layer", "krita_create_frame", "krita_select_frame",
-            "krita_get_current_frame", "krita_set_current_frame",
-            "krita_create_keyframe", "krita_delete_keyframe",
-            "krita_list_keyframes", "krita_has_keyframe",
-        }
-
         tools_for_model = []
         for t in tools_detailed:
             name = t.get("name")
@@ -151,21 +221,25 @@ def main():
                     "items": {
                         "type": "object",
                         "properties": {
-                            "points": {"type": "array", "description": "List of [x,y] pairs", "items": {"type": "array", "items": {"type": "integer"}}},
+                            "points": {"type": "array", "description": "List of [x, y] coordinate pairs", "items": {"type": "array", "items": {"type": "number"}}},
                             "pressure": {"type": "number", "description": "Optional pressure for stroke", "default": 1.0}
                         },
                         "required": ["points"]
                     }
-                }
+                },
+                "complete": {"type": "boolean", "description": "Set to true ONLY when this batch finishes the ENTIRE requested drawing (every color, every part). Set to false when more drawing is still to come."}
             },
-            "required": ["strokes"]
+            "required": ["strokes", "complete"]
         }
 
         tools_for_model.append({
             "type": "function",
             "function": {
                 "name": "krita_batch_draw",
-                "description": "Batch drawing: set color, brush, and multiple strokes in one call.",
+                "description": "Draw a complete drawing in ONE call: sets the color and brush, then paints ALL strokes. "
+                               "For every drawing request, plan the entire drawing and include every stroke in a single "
+                               "krita_batch_draw call. If multiple colors are needed, use one krita_batch_draw call per color "
+                               "in the SAME response, and set complete=true only in the LAST batch once the whole drawing is done.",
                 "parameters": batch_schema,
             },
         })
@@ -176,7 +250,146 @@ def main():
             print("  -", fn.get("name"))
         print("Model name:", config.groq_model)
 
+        # IMAGE REFERENCE MODE: Use vision to analyze and create drawing plan
+        vision_drawing_batches = None
+        if reference_image_path:
+            print("\n========== IMAGE REFERENCE MODE ==========")
+            print(f"Reference image: {reference_image_path}")
+            
+            # Verify image exists and has valid extension
+            if not os.path.exists(reference_image_path):
+                print(f"Error: Image file not found: {reference_image_path}")
+                return
+            
+            ext = os.path.splitext(reference_image_path)[1].lower()
+            if ext not in [".png", ".jpg", ".jpeg", ".webp"]:
+                print(f"Error: Unsupported image format: {ext}")
+                print("Supported formats: .png, .jpg, .jpeg, .webp")
+                return
+            
+            try:
+                # Get vision analysis
+                enhanced_prompt = create_drawing_plan_prompt(prompt)
+                vision_response = agent.analyze_image(reference_image_path, enhanced_prompt)
+                
+                print("\n--- Vision Analysis ---")
+                # Print first 500 chars of analysis for debugging
+                preview = vision_response[:500] + "..." if len(vision_response) > 500 else vision_response
+                print(preview)
+                print()
+                
+                # Convert vision plan to drawing batches
+                print("Converting vision analysis to drawing commands...")
+                vision_drawing_batches = vision_plan_to_drawing_batches(vision_response)
+                
+                if not vision_drawing_batches:
+                    print("Error: Could not create drawing plan from vision analysis.")
+                    return
+                
+                print(f"\nDrawing plan created:")
+                print(f"  Total batches: {len(vision_drawing_batches)}")
+                total_strokes = sum(len(b["strokes"]) for b in vision_drawing_batches)
+                print(f"  Total strokes: {total_strokes}")
+                print()
+                
+            except ValueError as e:
+                # JSON parsing errors from vision_plan_to_drawing_batches
+                print(f"Error: Vision model did not return valid JSON: {e}")
+                if 'vision_response' in locals():
+                    print("Response was:", vision_response[:500])
+                return
+            except Exception as e:
+                print(f"Error during vision analysis: {e}")
+                error_msg = str(e).lower()
+                if "decommissioned" in error_msg or "deprecated" in error_msg:
+                    print("\nThe vision model is no longer available.")
+                    print("Please update GROQ_VISION_MODEL in .env to a supported model.")
+                    print("Current supported vision model: qwen/qwen3.6-27b")
+                    print("\nTo fix: Edit .env and set:")
+                    print("  GROQ_VISION_MODEL=qwen/qwen3.6-27b")
+                traceback.print_exc()
+                return
+
         import json
+
+        # Execution statistics: actual Groq requests, MCP calls, and batches.
+        stats = {"groq_requests": 0, "mcp_calls": 0, "batches": 0}
+        t_start = time.time()
+
+        def mcp_call(name, arguments):
+            stats["mcp_calls"] += 1
+            return mcp.call_tool(name, arguments, timeout=60)
+
+        # IMAGE REFERENCE MODE: Execute vision-based drawing batches directly
+        if vision_drawing_batches:
+            print("\n========== EXECUTING DRAWING FROM REFERENCE ==========")
+            
+            for batch_idx, batch in enumerate(vision_drawing_batches):
+                batch_num = batch_idx + 1
+                print(f"\nExecuting batch {batch_num}/{len(vision_drawing_batches)}...")
+                print(f"  Color: {batch['color']}")
+                print(f"  Brush size: {batch['brush_size']}")
+                print(f"  Strokes: {len(batch['strokes'])}")
+                
+                stats["batches"] += 1
+                batch_results = []
+                
+                # Set color
+                color = batch.get("color")
+                if color:
+                    try:
+                        r = mcp_call("krita_set_color", {"color": color})
+                        batch_results.append({"action": "krita_set_color", "result": r})
+                        print(f"    Set color: {color}")
+                    except Exception as e:
+                        batch_results.append({"action": "krita_set_color", "error": str(e)})
+                        print(f"    Error setting color: {e}")
+                        traceback.print_exc()
+                
+                # Set brush size
+                brush_size = batch.get("brush_size")
+                if brush_size is not None:
+                    try:
+                        r = mcp_call("krita_set_brush", {"size": int(brush_size)})
+                        batch_results.append({"action": "krita_set_brush", "result": r})
+                        print(f"    Set brush size: {brush_size}")
+                    except Exception as e:
+                        batch_results.append({"action": "krita_set_brush", "error": str(e)})
+                        print(f"    Error setting brush: {e}")
+                        traceback.print_exc()
+                
+                # Draw all strokes
+                strokes = batch.get("strokes", [])
+                strokes_drawn = 0
+                for stroke_idx, stroke in enumerate(strokes):
+                    points = stroke.get("points", [])
+                    if len(points) < 2:
+                        batch_results.append({"action": "krita_stroke", "error": "Invalid points"})
+                        continue
+                    
+                    try:
+                        r = mcp_call("krita_stroke", {"points": points, "pressure": 1.0})
+                        batch_results.append({"action": "krita_stroke", "result": r})
+                        if "error" not in str(r).lower():
+                            strokes_drawn += 1
+                        
+                        # Progress indicator for large batches
+                        if (stroke_idx + 1) % 10 == 0 or stroke_idx == len(strokes) - 1:
+                            print(f"    Progress: {stroke_idx + 1}/{len(strokes)} strokes")
+                    except Exception as e:
+                        batch_results.append({"action": "krita_stroke", "error": str(e)})
+                        print(f"    Error drawing stroke {stroke_idx + 1}: {e}")
+                        traceback.print_exc()
+                
+                print(f"  Batch complete: {strokes_drawn}/{len(strokes)} strokes drawn")
+            
+            print("\n========== DRAWING COMPLETE ==========")
+            print(f"Total batches: {stats['batches']}")
+            print(f"Total MCP calls: {stats['mcp_calls']}")
+            print(f"Execution time: {time.time() - t_start:.2f}s")
+            print("\nThe reference image has been recreated in Krita using actual drawing operations.")
+            print("Check your Krita canvas to see the result.")
+            return
 
         # Classify the request so we can gate the final response on actual tool use.
         prompt_lower = prompt.lower()
@@ -197,10 +410,12 @@ def main():
         create_keyframe_count = 0
         last_draw_step = -1
         last_keyframe_step = -1
+        last_keyframes = None
+        tool_error_retries = 0
         follow_ups = 0
         for step in range(max_steps):
+            stats["groq_requests"] += 1
             print("Sending request to Groq (step", step + 1, ")...")
-            import time
             t0 = time.time()
             try:
                 resp = agent.call_model(messages, tools_for_model)
@@ -208,6 +423,18 @@ def main():
                 t1 = time.time()
                 model_duration = t1 - t0
                 print(f"Groq request: {model_duration:.3f}s")
+                emsg = str(e).lower()
+                if ("tool call" in emsg or "tool_use_failed" in emsg or "did not match" in emsg
+                        or "failed to parse" in emsg or "arguments" in emsg) and tool_error_retries < 3:
+                    tool_error_retries += 1
+                    print(f"Groq rejected a tool call ({tool_error_retries}/3); asking the model to fix it...")
+                    messages.append({
+                        "role": "user",
+                        "content": "Your previous tool call was rejected: the tool arguments were not valid JSON "
+                                   "(no // comments, no trailing commas, quoted keys, valid values only). "
+                                   "Re-issue the same tool call with corrected arguments.",
+                    })
+                    continue
                 print("Fatal error calling Groq:", e)
                 return
             else:
@@ -219,9 +446,14 @@ def main():
             try:
                 choice = resp.choices[0]
                 assistant_message = getattr(choice, "message", None)
+                finish_reason = getattr(choice, "finish_reason", None)
             except Exception:
                 print("Malformed model response:", resp)
                 return
+
+            # If the response was cut off at the token limit, the plan may be
+            # incomplete — do NOT fast-exit; let the model continue.
+            truncated = finish_reason == "length"
 
             model_text = assistant_message.content if hasattr(assistant_message, "content") else str(assistant_message)
             print("Model response:", model_text)
@@ -247,8 +479,13 @@ def main():
             # If the assistant invoked tool_calls, execute each and append matching tool results
             if tool_calls:
                 # measure MCP execution time for all tool_calls in this assistant message
-                import time
                 mcp_start = time.time()
+                batch_done = False
+                batch_strokes_drawn = 0
+                batch_color = None
+                batch_brush = None
+                batch_complete = False
+                pending_work_calls = 0
                 for tc in tool_calls:
                     tc_id = getattr(tc, "id", None)
                     fn = getattr(tc, "function", None)
@@ -259,7 +496,8 @@ def main():
                     print("  id:", tc_id)
                     print("  name:", fn_name)
 
-                    # Special handling: agent-side batch wrapper
+                    # Special handling: agent-side batch wrapper — executes the
+                    # complete drawing plan without any further Groq round trip.
                     if fn_name == "krita_batch_draw":
                         # fn_args expected to be an object with color, brush_size, strokes
                         args_obj = fn_args
@@ -269,53 +507,68 @@ def main():
                         except Exception:
                             args_obj = fn_args
 
+                        stats["batches"] += 1
                         batch_results = []
-                        # set color
-                        color = args_obj.get("color") if isinstance(args_obj, dict) else None
-                        if color:
-                            try:
-                                r = mcp.call_tool("krita_set_color", {"color": color}, timeout=60)
-                                batch_results.append({"action": "krita_set_color", "result": r})
-                                print("MCP →", r)
-                            except Exception as e:
-                                print("MCP call failed:", e)
-                                traceback.print_exc()
-                                return
-
-                        # set brush size if provided
-                        brush_size = args_obj.get("brush_size") if isinstance(args_obj, dict) else None
-                        if brush_size is not None:
-                            try:
-                                r = mcp.call_tool("krita_set_brush", {"size": brush_size}, timeout=60)
-                                batch_results.append({"action": "krita_set_brush", "result": r})
-                                print("MCP →", r)
-                            except Exception as e:
-                                print("MCP call failed:", e)
-                                traceback.print_exc()
-                                return
-
-                        # strokes
-                        strokes = args_obj.get("strokes") if isinstance(args_obj, dict) else None
-                        if strokes:
-                            for s in strokes:
-                                points = s.get("points")
-                                pressure = s.get("pressure", 1.0)
+                        color = None
+                        brush_size = None
+                        strokes_drawn = 0
+                        if isinstance(args_obj, dict):
+                            color = args_obj.get("color")
+                            if color:
                                 try:
-                                    r = mcp.call_tool("krita_stroke", {"points": points, "pressure": pressure}, timeout=60)
-                                    batch_results.append({"action": "krita_stroke", "result": r})
-                                    if "error" not in str(r).lower():
-                                        executed_drawing = True
+                                    r = mcp_call("krita_set_color", {"color": color})
+                                    batch_results.append({"action": "krita_set_color", "result": r})
+                                    print("MCP →", r)
                                 except Exception as e:
-                                    print("MCP call failed:", e)
+                                    batch_results.append({"action": "krita_set_color", "error": str(e)})
                                     traceback.print_exc()
-                                    return
+
+                            brush_size = args_obj.get("brush_size")
+                            if brush_size is not None:
+                                try:
+                                    r = mcp_call("krita_set_brush", {"size": int(brush_size)})
+                                    batch_results.append({"action": "krita_set_brush", "result": r})
+                                    print("MCP →", r)
+                                except Exception as e:
+                                    batch_results.append({"action": "krita_set_brush", "error": str(e)})
+                                    traceback.print_exc()
+
+                            strokes = args_obj.get("strokes") or []
+                            # Merge strokes that share an endpoint into a single
+                            # MCP call (identical pixels; the plugin blends with
+                            # max-alpha, so redrawing a joint is a no-op).
+                            merged = []
+                            for s in strokes:
+                                points = _extract_points(s)
+                                if len(points) < 2:
+                                    batch_results.append({"action": "krita_stroke", "error": "Invalid points"})
+                                    continue
+                                if merged and merged[-1][-1] == points[0]:
+                                    merged[-1].extend(points[1:])
+                                else:
+                                    merged.append(list(points))
+                            for points in merged:
+                                try:
+                                    r = mcp_call("krita_stroke", {"points": points, "pressure": 1.0})
+                                    batch_results.append({"action": "krita_stroke", "result": r})
+                                    print("MCP →", r)
+                                    if "error" not in str(r).lower():
+                                        strokes_drawn += 1
+                                except Exception as e:
+                                    batch_results.append({"action": "krita_stroke", "error": str(e)})
+                                    traceback.print_exc()
 
                         # Append a single tool result summarizing batch actions
                         messages.append({"role": "tool", "tool_call_id": tc_id, "content": str(batch_results)})
-                        # mark executed drawing if any strokes present
-                        if strokes:
+                        # Mark drawing executed if any strokes actually painted
+                        if strokes_drawn > 0:
                             executed_drawing = True
                             last_draw_step = step
+                            batch_done = True
+                            batch_strokes_drawn = strokes_drawn
+                            batch_color = color
+                            batch_brush = brush_size
+                            batch_complete = bool(args_obj.get("complete"))
                         continue
 
                     # Parse arguments if they're a JSON string
@@ -326,8 +579,25 @@ def main():
                     except Exception:
                         pass
 
+                    # Canvas/layer setup tools are part of planning and do not
+                    # block the fast path; anything else may mean more work.
+                    if fn_name not in ("krita_new_canvas", "krita_select_paint_layer"):
+                        pending_work_calls += 1
+
                     try:
-                        res = mcp.call_tool(fn_name, args or {}, timeout=60)
+                        res = mcp_call(fn_name, args or {})
+                        # The plugin creates real keyframes by driving Krita's
+                        # timeline UI, which is racy: it occasionally reports
+                        # "Failed to create keyframe" even though the state is
+                        # healthy. Retry a few times before giving up.
+                        if fn_name in ("krita_create_keyframe", "krita_create_frame") and "error" in str(res).lower():
+                            for attempt in range(1, 4):
+                                time.sleep(1.0)
+                                print(f"Retrying {fn_name} (attempt {attempt + 1}/4)...")
+                                res = mcp_call(fn_name, args or {})
+                                print("MCP →", res)
+                                if "error" not in str(res).lower():
+                                    break
                         print("MCP →", res)
                     except Exception as e:
                         print("MCP call failed:", e)
@@ -336,6 +606,10 @@ def main():
 
                     # Only count operations as performed if the tool actually succeeded
                     res_ok = "error" not in str(res).lower()
+
+                    # Remember the keyframe list when a result reports it
+                    if res_ok and isinstance(res, dict) and res.get("keyframes") is not None:
+                        last_keyframes = res["keyframes"]
 
                     # Mark drawing executed if applicable
                     if fn_name in ("krita_draw_shape", "krita_stroke", "krita_fill") and res_ok:
@@ -359,6 +633,32 @@ def main():
                 mcp_end = time.time()
                 mcp_duration = mcp_end - mcp_start
                 print(f"MCP execution: {mcp_duration:.3f}s")
+
+                # Fast path: the model planned the complete drawing in one batch
+                # and it executed successfully. For a plain drawing request there
+                # is nothing left to reason about — skip the summary round trip.
+                if (
+                    batch_done
+                    and batch_complete
+                    and batch_strokes_drawn > 0
+                    and not wants_animation
+                    and not truncated
+                    and pending_work_calls == 0
+                ):
+                    print("\nDrawing complete (no summary round trip needed):")
+                    print(f"  strokes drawn: {batch_strokes_drawn}")
+                    if batch_color:
+                        print(f"  color: {batch_color}")
+                    if batch_brush is not None:
+                        print(f"  brush size: {batch_brush}")
+                    print("Final assistant response:")
+                    summary = f"Drew {batch_strokes_drawn} stroke(s) on the Krita canvas."
+                    if batch_color:
+                        summary += f" Color: {batch_color}."
+                    if batch_brush is not None:
+                        summary += f" Brush size: {batch_brush}."
+                    print(summary)
+                    break
 
                 # After executing all tool calls, continue loop so model can respond
                 continue
@@ -394,20 +694,22 @@ def main():
                 follow_ups += 1
                 print("Model returned final text but the requested operation was not performed with tools. Prompting the model to use the tools.")
                 if wants_animation:
+                    kf_info = f" Keyframes currently on the paint layer: {last_keyframes}." if last_keyframes is not None else ""
                     followup = (
                         "You returned a natural-language response, but the user's animation request has not been completed: "
                         "no animation/frame tools were actually executed" + (" and no drawing was performed" if wants_drawing and not executed_drawing else "") + ". "
                         "You MUST use the Krita MCP tools to perform the work: "
                         "`krita_select_paint_layer`, `krita_create_keyframe(frame=...)`, `krita_set_current_frame(frame=...)`, "
-                        "verify with `krita_get_current_frame`/`krita_list_keyframes`, and draw with `krita_batch_draw`/`krita_stroke`/`krita_draw_shape`. "
-                        "If the frames already exist but the last-created frame has nothing drawn on it, switch to it with "
-                        "`krita_set_current_frame(frame=N)` and draw there before summarizing. "
+                        "verify with `krita_get_current_frame`/`krita_list_keyframes`, and draw with `krita_batch_draw`/`krita_stroke`/`krita_draw_shape`."
+                        + kf_info +
+                        " If a keyframe exists but has nothing drawn on it, switch to it with `krita_set_current_frame(frame=N)` "
+                        "and draw there before summarizing. "
                         "Only after the tools have succeeded, summarize what was created."
                     )
                 else:
                     followup = (
                         "You returned a natural-language response but the user's drawing request has not been completed because no drawing tool was used. "
-                        "Please invoke a drawing tool call (krita_batch_draw, krita_stroke or krita_draw_shape) to perform the actual drawing."
+                        "Please invoke the `krita_batch_draw` tool with the complete drawing in a single call: color, brush_size, all strokes, and complete=true."
                     )
                 messages.append({"role": "user", "content": followup})
                 continue
@@ -424,6 +726,12 @@ def main():
 
         else:
             print("Max steps reached without completion.")
+
+        print("\n========== PERFORMANCE SUMMARY ==========")
+        print(f"Total Groq requests: {stats['groq_requests']}")
+        print(f"Total MCP calls: {stats['mcp_calls']}")
+        print(f"Total batch drawing operations: {stats['batches']}")
+        print(f"Total execution time: {time.time() - t_start:.2f}s")
 
     except Exception as e:
         print("Fatal error:", e)

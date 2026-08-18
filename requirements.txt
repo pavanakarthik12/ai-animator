@@ -3,3 +3,4 @@ python-dotenv
 fastmcp
 mcp
 httpx
+pillow
