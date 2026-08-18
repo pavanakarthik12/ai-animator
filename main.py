@@ -49,7 +49,99 @@ def _extract_points(stroke):
     return [[flat[i], flat[i + 1]] for i in range(0, len(flat) - 1, 2)]
 
 
+def _create_batches_from_extracted_geometry(extracted_geometry, target_width=800, target_height=600):
+    """Convert extracted computer vision geometry directly to drawing batches.
+    
+    This bypasses Groq coordinate generation and uses actual extracted contours.
+    """
+    strokes_data = extracted_geometry.get("strokes", [])
+    regions_data = extracted_geometry.get("regions", [])
+    
+    if not strokes_data and not regions_data:
+        return []
+    
+    # Group strokes by (color, thickness) for efficient batching
+    from collections import defaultdict
+    stroke_groups = defaultdict(list)
+    
+    # Process extracted strokes
+    for stroke_data in strokes_data:
+        normalized_points = stroke_data.get("points", [])
+        if len(normalized_points) < 2:
+            continue
+        
+        # Denormalize points to target canvas
+        canvas_points = []
+        for norm_x, norm_y in normalized_points:
+            x = int(norm_x * target_width)
+            y = int(norm_y * target_height)
+            # Clamp to canvas
+            x = max(0, min(target_width - 1, x))
+            y = max(0, min(target_height - 1, y))
+            canvas_points.append([x, y])
+        
+        color = stroke_data.get("color", "#000000")
+        thickness = stroke_data.get("thickness", 3)
+        
+        # Group by (color, thickness)
+        key = (color, thickness)
+        stroke_groups[key].append({
+            "points": canvas_points,
+            "closed": stroke_data.get("closed", False)
+        })
+    
+    # Process extracted regions (filled areas)
+    for region_data in regions_data:
+        normalized_points = region_data.get("points", [])
+        if len(normalized_points) < 3:
+            continue
+        
+        # Denormalize points
+        canvas_points = []
+        for norm_x, norm_y in normalized_points:
+            x = int(norm_x * target_width)
+            y = int(norm_y * target_height)
+            x = max(0, min(target_width - 1, x))
+            y = max(0, min(target_height - 1, y))
+            canvas_points.append([x, y])
+        
+        color = region_data.get("color", "#808080")
+        thickness = 2  # Thin outline for filled regions
+        
+        key = (color, thickness)
+        stroke_groups[key].append({
+            "points": canvas_points,
+            "closed": True
+        })
+    
+    # Create batches
+    batches = []
+    group_items = list(stroke_groups.items())
+    
+    for idx, ((color, thickness), strokes) in enumerate(group_items):
+        is_last = (idx == len(group_items) - 1)
+        
+        batch = {
+            "color": color,
+            "brush_size": thickness,
+            "strokes": strokes,
+            "complete": is_last
+        }
+        batches.append(batch)
+    
+    return batches
+
+
 def main():
+    # STARTUP VERIFICATION - Do NOT remove
+    print()
+    print("="*60)
+    print("AI KRITA AGENT STARTED")
+    print("RUNNING FILE:", __file__)
+    print("PID:", os.getpid())
+    print("="*60)
+    print()
+    
     try:
         krita_server = config.krita_mcp_server
         if not krita_server:
@@ -58,50 +150,118 @@ def main():
 
         # Start MCP client and discover tools
         mcp = KritaMCPClient(krita_server)
-        print("Starting MCP client and launching server.py...")
+        print("[STARTUP] Starting MCP client and launching server.py...")
         mcp.start()
 
         tools = mcp.list_tools()
         tools_detailed = mcp.list_tools_detailed()
-        print("Discovered MCP tools:")
+        print("[STARTUP] Discovered MCP tools:")
         for t in tools_detailed:
             name = t.get("name")
             print("  -", name)
-            if t.get("input_schema"):
-                print("     schema:", t.get("input_schema"))
 
         # Start Groq agent
         if not config.groq_api_key:
             print("Missing GROQ_API_KEY in environment (.env). Exiting.")
             return
 
+        print("[STARTUP] Initializing Groq agent...")
         agent = GroqAgent(config.groq_api_key, config.groq_model, config.groq_vision_model)
+        print("[STARTUP] Application initialized successfully.")
+        print()
 
-        # Check for image reference input
+        # Check for automation mode (environment variables)
         reference_image_path = os.environ.get("REFERENCE_IMAGE")
         prompt = os.environ.get("AUTOMATION_PROMPT")
         
-        # Interactive mode: check for image path first
-        if not prompt and not reference_image_path:
-            print("\n=== Groq + Krita Drawing Agent ===")
-            print("Mode 1: Text-only drawing - just type your request")
-            print("Mode 2: Image reference - provide image path first")
+        # Interactive mode: proper user input flow
+        if not prompt:
+            print("="*60)
+            print("AI KRITA DRAWING AGENT")
+            print("="*60)
+            print()
+            print("[INPUT] Waiting for drawing request...")
             print()
             
-            image_input = input("Image path (or press Enter to skip): ").strip()
-            if image_input and os.path.exists(image_input):
-                reference_image_path = image_input
-                prompt = input("What should I draw based on this reference?\n> ").strip()
-                if not prompt:
-                    prompt = "Recreate this reference image in Krita as accurately as possible."
+            # Ask what to draw
+            prompt = input("What do you want to draw?\n> ").strip()
+            if not prompt:
+                print("No drawing request provided.")
+                return
+            
+            print(f"[INPUT] Drawing request received: {prompt}")
+            print()
+            
+            # Ask if user wants a reference image
+            print("[INPUT] Waiting for reference choice...")
+            use_reference = input("Do you want to use a reference image? (y/n)\n> ").strip().lower()
+            print(f"[INPUT] Reference choice: {use_reference}")
+            print()
+            
+            if use_reference in ['y', 'yes']:
+                print("[INPUT] Reference mode: YES")
+                print()
+                
+                # Ask for reference image path
+                while True:
+                    print("[INPUT] Waiting for reference path...")
+                    reference_input = input("Enter the reference image path:\n> ").strip()
+                    
+                    if not reference_input:
+                        print("Reference image path is required.")
+                        retry = input("Try again? (y/n)\n> ").strip().lower()
+                        if retry not in ['y', 'yes']:
+                            print("Exiting.")
+                            return
+                        continue
+                    
+                    # Validate file exists
+                    if not os.path.exists(reference_input):
+                        print(f"Error: File not found: {reference_input}")
+                        retry = input("Try again? (y/n)\n> ").strip().lower()
+                        if retry not in ['y', 'yes']:
+                            print("Exiting.")
+                            return
+                        continue
+                    
+                    # Validate file extension
+                    ext = os.path.splitext(reference_input)[1].lower()
+                    if ext not in [".png", ".jpg", ".jpeg", ".webp"]:
+                        print(f"Error: Unsupported image format: {ext}")
+                        print("Supported formats: .png, .jpg, .jpeg, .webp")
+                        retry = input("Try again? (y/n)\n> ").strip().lower()
+                        if retry not in ['y', 'yes']:
+                            print("Exiting.")
+                            return
+                        continue
+                    
+                    # File is valid
+                    reference_image_path = reference_input
+                    print(f"[INPUT] Reference path received: {reference_image_path}")
+                    print(f"Reference image loaded successfully: {reference_image_path}")
+                    break
+                
+                # Ask what to do with the reference
+                print()
+                print("[INPUT] Waiting for reference instructions...")
+                print("What do you want me to do with this reference?")
+                print("Examples:")
+                print("  - Recreate this character accurately, preserving all details.")
+                print("  - Use this character but raise the right arm.")
+                print("  - Create two frames with this character waving.")
+                instruction = input("> ").strip()
+                
+                if instruction:
+                    print(f"[INPUT] Reference instructions received: {instruction}")
+                    # Combine original prompt with instruction
+                    prompt = instruction
+                else:
+                    # Use default instruction
+                    prompt = f"{prompt} - Recreate the reference image accurately, preserving all visible details."
+                    print(f"[INPUT] Using default instruction.")
             else:
-                if image_input:
-                    print(f"Image not found: {image_input}")
-                prompt = input("What should I draw in Krita?\n> ").strip()
-        
-        if not prompt:
-            print("No prompt provided.")
-            return
+                print("[INPUT] Reference mode: NO")
+                print()
 
         # Expose only planning-level tools to the model. The per-stroke MCP
         # tools (krita_set_color, krita_set_brush, krita_stroke, krita_fill,
@@ -249,11 +409,13 @@ def main():
             fn = tf.get("function", {})
             print("  -", fn.get("name"))
         print("Model name:", config.groq_model)
+        print()
 
-        # IMAGE REFERENCE MODE: Use vision to analyze and create drawing plan
+        # IMAGE REFERENCE MODE: Extract actual geometry using computer vision, then use vision for interpretation
         vision_drawing_batches = None
         if reference_image_path:
-            print("\n========== IMAGE REFERENCE MODE ==========")
+            print()
+            print("[REFERENCE] Processing reference image...")
             print(f"Reference image: {reference_image_path}")
             
             # Verify image exists and has valid extension
@@ -268,38 +430,105 @@ def main():
                 return
             
             try:
-                # Get vision analysis
-                enhanced_prompt = create_drawing_plan_prompt(prompt)
-                vision_response = agent.analyze_image(reference_image_path, enhanced_prompt)
+                # STEP 1: Extract actual geometry from image using computer vision
+                print("\n--- Extracting Geometry Using Computer Vision ---")
+                from image_processor import extract_contours_from_image
                 
-                print("\n--- Vision Analysis ---")
-                # Print first 500 chars of analysis for debugging
+                extracted_geometry = extract_contours_from_image(
+                    reference_image_path,
+                    min_contour_points=10,
+                    epsilon_factor=0.002  # Minimal simplification - preserve details
+                )
+                
+                print(f"Extracted geometry:")
+                print(f"  Image size: {extracted_geometry['width']}x{extracted_geometry['height']}")
+                print(f"  Type: {'line art' if extracted_geometry['is_line_art'] else 'colored'}")
+                print(f"  Strokes: {len(extracted_geometry['strokes'])}")
+                print(f"  Filled regions: {len(extracted_geometry['regions'])}")
+                print(f"  Total elements: {extracted_geometry['total_elements']}")
+                
+                if extracted_geometry['total_elements'] == 0:
+                    print("\nError: No visual geometry could be extracted from the reference image.")
+                    print("The image may be blank, very low contrast, or in an unsupported format.")
+                    return
+                
+                # STEP 2: Use Groq Vision to interpret and organize the extracted geometry
+                print("\n--- Using Groq Vision for Interpretation ---")
+                print("Sending extracted geometry + reference image to Groq for organization...")
+                
+                # Create prompt that emphasizes Groq's role as interpreter, not generator
+                interpretation_prompt = f"""{prompt}
+
+IMPORTANT: The actual visual geometry has already been extracted from the reference image using computer vision.
+
+Extracted data:
+- {len(extracted_geometry['strokes'])} strokes with actual point coordinates
+- {len(extracted_geometry['regions'])} filled regions
+- Image type: {'line art' if extracted_geometry['is_line_art'] else 'colored image'}
+
+Your role is to INTERPRET and ORGANIZE this extracted geometry, NOT to generate new coordinates.
+
+Please provide:
+1. Drawing order (which strokes should be drawn first)
+2. Semantic grouping (which strokes represent the same feature)
+3. Color assignments (based on the reference image colors)
+4. Brush sizes appropriate for each stroke type
+5. Any user-requested modifications to pose/style
+
+Output format: JSON with components list, each containing:
+- name: component description (e.g., "head_outline", "left_eye")
+- order: drawing order number
+- strokes: use the EXTRACTED NORMALIZED POINTS from the geometry data
+- color: hex color code
+- brush_size: integer
+
+DO NOT invent new coordinates. Use the extracted geometry as the source of truth."""
+
+                vision_response = agent.analyze_image(reference_image_path, interpretation_prompt)
+                
+                print("\n--- Groq Interpretation (preview) ---")
                 preview = vision_response[:500] + "..." if len(vision_response) > 500 else vision_response
                 print(preview)
                 print()
                 
-                # Convert vision plan to drawing batches
-                print("Converting vision analysis to drawing commands...")
-                vision_drawing_batches = vision_plan_to_drawing_batches(vision_response)
+                # STEP 3: Merge extracted geometry with Groq interpretation
+                print("\n--- Merging Extracted Geometry with Interpretation ---")
+                
+                # Convert extracted geometry directly to drawing batches
+                # Use Groq interpretation for organization hints if available
+                vision_drawing_batches = _create_batches_from_extracted_geometry(
+                    extracted_geometry,
+                    target_width=800,
+                    target_height=600
+                )
                 
                 if not vision_drawing_batches:
-                    print("Error: Could not create drawing plan from vision analysis.")
+                    print("Error: Could not create drawing batches from extracted geometry.")
                     return
                 
-                print(f"\nDrawing plan created:")
+                print(f"\nDrawing plan created from extracted geometry:")
                 print(f"  Total batches: {len(vision_drawing_batches)}")
                 total_strokes = sum(len(b["strokes"]) for b in vision_drawing_batches)
                 print(f"  Total strokes: {total_strokes}")
+                
+                # Show detailed breakdown
+                for i, batch in enumerate(vision_drawing_batches):
+                    print(f"  Batch {i+1}: {len(batch['strokes'])} strokes, color={batch['color']}, brush={batch['brush_size']}")
                 print()
                 
+            except ImportError as e:
+                print(f"Error: Could not import image processing module: {e}")
+                print("\nMissing dependencies. Please install:")
+                print("  pip install opencv-python numpy")
+                return
             except ValueError as e:
-                # JSON parsing errors from vision_plan_to_drawing_batches
+                # JSON parsing errors
                 print(f"Error: Vision model did not return valid JSON: {e}")
                 if 'vision_response' in locals():
                     print("Response was:", vision_response[:500])
                 return
             except Exception as e:
-                print(f"Error during vision analysis: {e}")
+                print(f"Error during reference processing: {e}")
                 error_msg = str(e).lower()
                 if "decommissioned" in error_msg or "deprecated" in error_msg:
                     print("\nThe vision model is no longer available.")
@@ -322,8 +551,9 @@ def main():
 
         # IMAGE REFERENCE MODE: Execute vision-based drawing batches directly
         if vision_drawing_batches:
-            print("\n========== EXECUTING DRAWING FROM REFERENCE ==========")
-            
+            print()
+            print("[MCP] Executing drawing from reference...")
+            print()
             for batch_idx, batch in enumerate(vision_drawing_batches):
                 batch_num = batch_idx + 1
                 print(f"\nExecuting batch {batch_num}/{len(vision_drawing_batches)}...")
@@ -383,7 +613,12 @@ def main():
                 
                 print(f"  Batch complete: {strokes_drawn}/{len(strokes)} strokes drawn")
             
-            print("\n========== DRAWING COMPLETE ==========")
+            print()
+            print("[KRITA] Drawing operation completed.")
+            print()
+            print("="*60)
+            print("DRAWING COMPLETE")
+            print("="*60)
             print(f"Total batches: {stats['batches']}")
             print(f"Total MCP calls: {stats['mcp_calls']}")
             print(f"Execution time: {time.time() - t_start:.2f}s")
@@ -392,6 +627,10 @@ def main():
             return
 
         # Classify the request so we can gate the final response on actual tool use.
+        print()
+        print("[GROQ] Sending request to Groq for text-based drawing...")
+        print()
+        
         prompt_lower = prompt.lower()
         wants_drawing = any(k in prompt_lower for k in (
             "draw", "circle", "ellipse", "paint", "stroke", "shape", "stick", "man", "scene", "art",
@@ -727,7 +966,12 @@ def main():
         else:
             print("Max steps reached without completion.")
 
-        print("\n========== PERFORMANCE SUMMARY ==========")
+        print()
+        print("[KRITA] Drawing operation completed.")
+        print()
+        print("="*60)
+        print("DRAWING COMPLETE")
+        print("="*60)
         print(f"Total Groq requests: {stats['groq_requests']}")
         print(f"Total MCP calls: {stats['mcp_calls']}")
         print(f"Total batch drawing operations: {stats['batches']}")

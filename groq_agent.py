@@ -66,75 +66,61 @@ class GroqAgent:
 
     def analyze_image(self, image_path: str, prompt: str) -> str:
         """Analyze an image using Groq vision model and return structured drawing plan."""
-        # Read and encode image
-        with open(image_path, "rb") as f:
-            image_data = base64.b64encode(f.read()).decode("utf-8")
+        from PIL import Image
+        import io
         
-        # Determine image format
-        ext = os.path.splitext(image_path)[1].lower()
-        mime_type = {
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".webp": "image/webp"
-        }.get(ext, "image/png")
+        # Load and resize image if too large
+        try:
+            img = Image.open(image_path)
+            
+            # Calculate size - aim for 192px max (very small) to stay under token limit
+            max_size = 192
+            width, height = img.size
+            
+            if width > max_size or height > max_size:
+                if width > height:
+                    new_width = max_size
+                    new_height = int(height * (max_size / width))
+                else:
+                    new_height = max_size
+                    new_width = int(width * (max_size / height))
+                
+                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                print(f"Resized image: {width}x{height} → {new_width}x{new_height}")
+            
+            # Convert to bytes with compression
+            img_bytes = io.BytesIO()
+            # Convert to RGB if needed (for JPEG)
+            if img.mode in ('RGBA', 'LA', 'P'):
+                rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                rgb_img.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                img = rgb_img
+            
+            # Use JPEG with lower quality to reduce size
+            img.save(img_bytes, format='JPEG', quality=60, optimize=True)
+            image_data = base64.b64encode(img_bytes.getvalue()).decode("utf-8")
+            mime_type = "image/jpeg"
+            
+        except Exception as e:
+            print(f"Error loading image, using original: {e}")
+            # Fallback to original method
+            with open(image_path, "rb") as f:
+                image_data = base64.b64encode(f.read()).decode("utf-8")
+            
+            ext = os.path.splitext(image_path)[1].lower()
+            mime_type = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp"
+            }.get(ext, "image/png")
         
-        # Create vision analysis prompt
-        vision_prompt = f"""Analyze this image and provide a STRUCTURED DRAWING PLAN in JSON format for reproducing it in Krita.
-
-USER REQUEST: {prompt}
-
-Create a detailed JSON drawing plan with these fields:
-
-1. canvas: {{width, height}} - dimensions based on image aspect ratio (recommended: 800x600 or similar)
-2. analysis: brief text description of the image
-3. elements: array of drawable primitives
-
-Each element must have:
-- order: number (1, 2, 3...) for drawing sequence (background first, details last)
-- type: "stroke" | "ellipse" | "rectangle"
-- description: what this element represents
-- Position/geometry (depends on type):
-  * stroke: "points": [[x,y], [x,y], ...] with 10-20+ points for curves
-  * ellipse: "center": [x,y], "width": number, "height": number
-  * rectangle: "top_left": [x,y], "width": number, "height": number
-- color: hex code (e.g. "#000000" for black lines, "#f5d7b8" for skin)
-- For shapes: "outline_color": hex code for the border
-- brush_size: integer (2-5 typical)
-
-IMPORTANT RULES:
-- Return ONLY valid JSON, no thinking text, no markdown, no explanations
-- Use enough points for smooth curves (minimum 10-20 points per curved line)
-- Preserve proportions and relative positioning accurately
-- Include all visible elements (head, body, arms, legs, facial features, etc.)
-- Use appropriate colors from the image
-- Order elements logically (background → body → details)
-
-Example structure:
-{{
-  "canvas": {{"width": 800, "height": 600}},
-  "analysis": "Stick figure character in thinking pose",
-  "elements": [
-    {{
-      "order": 1,
-      "type": "ellipse",
-      "description": "head",
-      "center": [400, 150],
-      "width": 120,
-      "height": 130,
-      "outline_color": "#000000",
-      "brush_size": 3
-    }},
-    {{
-      "order": 2,
-      "type": "stroke",
-      "description": "body torso",
-      "points": [[400, 215], [400, 350]],
-      "color": "#000000",
-      "brush_size": 3
-    }}
-  ]
-}}"""
+        # Minimal prompt to stay under token limit
+        vision_prompt = f"""JSON only:
+{{"canvas":{{"width":<w>,"height":<h>}},"components":[{{"name":"part","order":1,"strokes":[{{"normalized_points":[[0.5,0.2],...],"color":"#000","brush_size":4,"closed":false}}]}}]}}
+Extract head,eyes,nose,mouth,hair,body,arms,legs. Coords 0-1. 15+ pts/curve."""
 
         messages = [
             {
@@ -155,13 +141,29 @@ Example structure:
         ]
         
         print(f"Sending image to Groq Vision ({self.vision_model})...")
-        resp = self._post_with_retry(
-            model=self.vision_model,
-            messages=messages,
-            max_completion_tokens=4096,
-            temperature=0.3,  # Lower temperature for more consistent analysis
-            response_format={"type": "json_object"}  # Force JSON mode
-        )
+        
+        try:
+            # Try with JSON mode first
+            resp = self._post_with_retry(
+                model=self.vision_model,
+                messages=messages,
+                max_completion_tokens=2000,  # Reduced to stay under TPM limit
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+        except Exception as e:
+            error_msg = str(e)
+            if "json_validate_failed" in error_msg or "Failed to validate JSON" in error_msg:
+                print("JSON mode failed, retrying without JSON mode constraint...")
+                # Retry without JSON mode - rely on extraction
+                resp = self._post_with_retry(
+                    model=self.vision_model,
+                    messages=messages,
+                    max_completion_tokens=2000,
+                    temperature=0.1
+                )
+            else:
+                raise
         
         content = resp.choices[0].message.content
         print("Vision analysis complete.")
