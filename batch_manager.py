@@ -148,20 +148,24 @@ class SmartBatchManager:
                         last_brush = brush_size
                         
                     strokes = batch.get("strokes", [])
-                    merged = []
-                    
-                    for s in strokes:
-                        points = _extract_points(s)
-                        if len(points) < 2:
-                            continue
-                        if merged and merged[-1][-1] == points[0]:
-                            merged[-1].extend(points[1:])
-                        else:
-                            merged.append(list(points))
-                            
                     strokes_drawn = 0
                     
-                    for points in merged:
+                    for stroke_item in strokes:
+                        if isinstance(stroke_item, dict):
+                            points = stroke_item.get("points", [])
+                            sid = stroke_item.get("stroke_id", "unknown")
+                        else:
+                            points = stroke_item
+                            sid = "unknown"
+                            
+                        if len(points) < 2:
+                            continue
+                            
+                        print(f"MCP draw:")
+                        print(f"stroke_id={sid}")
+                        print(f"width={brush_size}")
+                        print(f"points={len(points)}")
+                        
                         res = self.mcp.call_tool("krita_stroke", {"points": points, "pressure": 1.0}, timeout=30)
                         self.metrics["mcp_requests"] += 1
                         

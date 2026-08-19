@@ -64,6 +64,31 @@ def _create_batches_from_extracted_geometry(extracted_geometry, target_width=800
     if not strokes_data and not regions_data:
         return []
         
+    print("\n============================================================")
+    print("STROKE PRE-BATCH DIAGNOSTICS")
+    print("============================================================")
+    for s in strokes_data:
+        sid = s.get("stroke_id", "unknown")
+        pass_src = s.get("pass", "unknown")
+        pts_len = len(s.get("points", []))
+        w = s.get("thickness", 0)
+        col = s.get("color", "#000000")
+        
+        # approximate bbox
+        xs = [p[0]*ref_width for p in s.get("points", [])]
+        ys = [p[1]*ref_height for p in s.get("points", [])]
+        bbox = (min(xs), min(ys), max(xs), max(ys)) if xs else (0,0,0,0)
+        cat = "outer" if "1" in pass_src else "internal"
+        
+        print(f"Stroke {sid}:")
+        print(f"  category = {cat}")
+        print(f"  bbox = ({bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f})")
+        print(f"  width = {w:.1f}")
+        print(f"  color = {col}")
+        print(f"  source = {pass_src}")
+        print("")
+
+        
     # 1. PRESERVE ASPECT RATIO - Calculate UNIFORM scale
     scale_x = target_width / ref_width
     scale_y = target_height / ref_height
@@ -81,13 +106,20 @@ def _create_batches_from_extracted_geometry(extracted_geometry, target_width=800
     offset_x = (target_width - scaled_w) / 2
     offset_y = (target_height - scaled_h) / 2
     
-    print("\n--- Geometry Transformation ---")
-    print(f"Reference: {ref_width} x {ref_height}")
-    print(f"Krita: {target_width} x {target_height}")
-    print(f"Fit mode: {fit_mode}")
-    print(f"Uniform scale: {scale:.4f}")
-    print(f"Offset: x = {offset_x:.1f}, y = {offset_y:.1f}")
-    print("-------------------------------\n")
+    # 4. CALIBRATION FACTOR
+    REFERENCE_TO_KRITA_BRUSH_SCALE = 1.0 # Calibrated factor
+    
+    print("\n============================================================")
+    print("WIDTH CALCULATION DIAGNOSTICS")
+    print("============================================================")
+    if strokes_data:
+        sample_s = strokes_data[0]
+        sw = sample_s.get("thickness", 2)
+        print(f"reference_width: {ref_width}")
+        print(f"estimated_reference_stroke_width: {sw}")
+        print(f"uniform_scale: {scale:.4f}")
+        print(f"final_krita_brush_size: {max(1, int(round(sw * scale * REFERENCE_TO_KRITA_BRUSH_SCALE)))}")
+    print("============================================================\n")
     
     # Group strokes by (color, thickness) for efficient batching
     from collections import defaultdict
@@ -117,19 +149,21 @@ def _create_batches_from_extracted_geometry(extracted_geometry, target_width=800
         
         color = stroke_data.get("color", "#000000")
         
-        # 6. STROKE THICKNESS MUST SCALE WITH THE IMAGE
-        ref_thickness = stroke_data.get("thickness", 3)
-        # Apply uniform scale to thickness, ensure at least 1px
-        krita_thickness = max(1, int(round(ref_thickness * scale)))
+        # Ensure brush size is appropriately scaled
+        ref_thickness = stroke_data.get("thickness", 2)
+        krita_thickness = max(1, int(round(ref_thickness * scale * REFERENCE_TO_KRITA_BRUSH_SCALE)))
         
-        # Group by (color, thickness)
+        sid = stroke_data.get("stroke_id", "unknown")
+        
+        # Group identical drawing properties
         key = (color, krita_thickness)
         stroke_groups[key].append({
+            "stroke_id": sid,
             "points": canvas_points,
             "closed": stroke_data.get("closed", False)
         })
-    
-    # Process extracted regions
+        
+    # Process regions
     for region_data in regions_data:
         normalized_points = region_data.get("points", [])
         if len(normalized_points) < 3:
@@ -146,31 +180,40 @@ def _create_batches_from_extracted_geometry(extracted_geometry, target_width=800
             canvas_points.append([x, y])
             
         color = region_data.get("color", "#808080")
-        # Regions typically need a thin boundary if drawn as strokes
-        krita_thickness = max(1, int(round(2 * scale)))
+        krita_thickness = 1
+        
         key = (color, krita_thickness)
         stroke_groups[key].append({
+            "stroke_id": "region_fill",
             "points": canvas_points,
             "closed": True
         })
-    
-    # Convert groups to batches
-    batches = []
-    group_items = list(stroke_groups.items())
-    
-    for idx, ((color, thickness), strokes) in enumerate(group_items):
-        is_last = (idx == len(group_items) - 1)
         
-        batch = {
+    # Convert grouped strokes to batches
+    batches = []
+    batched_strokes_count = 0
+    for (color, thickness), strokes in stroke_groups.items():
+        batched_strokes_count += len(strokes)
+        batches.append({
             "color": color,
             "brush_size": thickness,
             "strokes": strokes,
-            "complete": is_last
-        }
-        batches.append(batch)
+            "complete": False
+        })
+        
+    if batches:
+        batches[-1]["complete"] = True
+        
+    final_strokes_count = sum(len(b["strokes"]) for b in batches)
+        
+    print("\n============================================================")
+    print("STROKE COUNT AUDIT")
+    print("============================================================")
+    print(f"Final drawing strokes: {final_strokes_count}")
+    print(f"Batched strokes: {batched_strokes_count}")
+    print("============================================================\n")
         
     return batches
-
 
 def main():
     # STARTUP VERIFICATION - Do NOT remove
@@ -498,10 +541,9 @@ def main():
                 wants_trace = any(k in prompt_lower for k in ("trace", "accurate", "preserve", "exact", "copy", "recreate"))
                 wants_modify = any(k in prompt_lower for k in ("change", "modify", "remove", "add", "make", "raise", "move", "ignore", "only", "but"))
                 
-                reference_mode = "ai_interpret"
-                if wants_trace and not wants_modify:
-                    reference_mode = "trace"
-                elif wants_trace and wants_modify:
+                # DIAGNOSTIC MODE: Force trace mode to test pure CV geometry
+                reference_mode = "trace"
+                if wants_modify:
                     reference_mode = "trace_hybrid"
                 
                 print(f"\n--- Selected Reference Mode: {reference_mode.upper()} ---")
