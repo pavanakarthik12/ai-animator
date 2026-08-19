@@ -35,17 +35,50 @@ def extract_json_from_response(response: str) -> Dict[str, Any]:
 
 def denormalize_points(normalized_points: List[List[float]], 
                        target_width: int, 
-                       target_height: int) -> List[List[int]]:
+                       target_height: int,
+                       ref_width: int = None,
+                       ref_height: int = None,
+                       fit_mode: str = "contain") -> List[List[int]]:
     """Convert normalized coordinates (0.0-1.0) to actual canvas coordinates."""
     denormalized = []
-    for point in normalized_points:
-        x_norm, y_norm = point[0], point[1]
-        x = int(x_norm * target_width)
-        y = int(y_norm * target_height)
-        # Clamp to canvas bounds
-        x = max(0, min(target_width - 1, x))
-        y = max(0, min(target_height - 1, y))
-        denormalized.append([x, y])
+    
+    if ref_width is not None and ref_height is not None:
+        # Uniform scaling to preserve aspect ratio
+        scale_x = target_width / ref_width
+        scale_y = target_height / ref_height
+        
+        if fit_mode == "contain":
+            scale = min(scale_x, scale_y)
+        elif fit_mode == "cover":
+            scale = max(scale_x, scale_y)
+        else:
+            scale = min(scale_x, scale_y)
+            
+        scaled_w = ref_width * scale
+        scaled_h = ref_height * scale
+        offset_x = (target_width - scaled_w) / 2
+        offset_y = (target_height - scaled_h) / 2
+        
+        for point in normalized_points:
+            x_norm, y_norm = point[0], point[1]
+            ref_x = x_norm * ref_width
+            ref_y = y_norm * ref_height
+            x = int(ref_x * scale + offset_x)
+            y = int(ref_y * scale + offset_y)
+            # Clamp to canvas bounds
+            x = max(0, min(target_width - 1, x))
+            y = max(0, min(target_height - 1, y))
+            denormalized.append([x, y])
+    else:
+        # Fallback to independent scaling
+        for point in normalized_points:
+            x_norm, y_norm = point[0], point[1]
+            x = int(x_norm * target_width)
+            y = int(y_norm * target_height)
+            # Clamp to canvas bounds
+            x = max(0, min(target_width - 1, x))
+            y = max(0, min(target_height - 1, y))
+            denormalized.append([x, y])
     
     return denormalized
 
@@ -102,12 +135,27 @@ def interpolate_points(points: List[List[int]], target_density: int = 20) -> Lis
 
 def process_component_strokes(component: Dict[str, Any], 
                               target_width: int, 
-                              target_height: int) -> List[Dict[str, Any]]:
+                              target_height: int,
+                              ref_width: int = None,
+                              ref_height: int = None,
+                              fit_mode: str = "contain") -> List[Dict[str, Any]]:
     """Process all strokes in a component, converting normalized coords to canvas coords."""
     processed_strokes = []
     
     strokes = component.get("strokes", [])
     component_name = component.get("name", "unknown")
+    
+    # Calculate scale for brush size
+    scale = 1.0
+    if ref_width is not None and ref_height is not None:
+        scale_x = target_width / ref_width
+        scale_y = target_height / ref_height
+        if fit_mode == "contain":
+            scale = min(scale_x, scale_y)
+        elif fit_mode == "cover":
+            scale = max(scale_x, scale_y)
+        else:
+            scale = min(scale_x, scale_y)
     
     for stroke_idx, stroke in enumerate(strokes):
         normalized_points = stroke.get("normalized_points", [])
@@ -116,7 +164,7 @@ def process_component_strokes(component: Dict[str, Any],
             continue
         
         # Convert normalized coordinates to canvas coordinates
-        canvas_points = denormalize_points(normalized_points, target_width, target_height)
+        canvas_points = denormalize_points(normalized_points, target_width, target_height, ref_width, ref_height, fit_mode)
         
         # Interpolate if needed for smoother curves
         if len(canvas_points) < 15:
@@ -125,10 +173,14 @@ def process_component_strokes(component: Dict[str, Any],
         # Apply light smoothing
         canvas_points = smooth_stroke_points(canvas_points, smoothing_factor=0.2)
         
+        # Scale brush size
+        ref_brush_size = stroke.get("brush_size", 3)
+        krita_brush_size = max(1, int(round(ref_brush_size * scale)))
+        
         processed_stroke = {
             "points": canvas_points,
             "color": stroke.get("color", "#000000"),
-            "brush_size": stroke.get("brush_size", 3),
+            "brush_size": krita_brush_size,
             "closed": stroke.get("closed", False),
             "component": component_name,
             "order": component.get("order", 999)
@@ -141,7 +193,10 @@ def process_component_strokes(component: Dict[str, Any],
 
 def vision_plan_to_drawing_batches(vision_response: str, 
                                    target_width: int = 800, 
-                                   target_height: int = 600) -> List[Dict[str, Any]]:
+                                   target_height: int = 600,
+                                   ref_width: int = None,
+                                   ref_height: int = None,
+                                   fit_mode: str = "contain") -> List[Dict[str, Any]]:
     """Convert detailed vision analysis JSON into batched drawing commands.
     
     New format: component-based with normalized coordinates.
@@ -157,7 +212,7 @@ def vision_plan_to_drawing_batches(vision_response: str,
     
     # Check for new component-based format
     if "components" in plan:
-        return _process_component_based_plan(plan, target_width, target_height)
+        return _process_component_based_plan(plan, target_width, target_height, ref_width, ref_height, fit_mode)
     
     # Fallback to old element-based format for backward compatibility
     return _process_legacy_element_plan(plan, target_width, target_height)
@@ -165,7 +220,10 @@ def vision_plan_to_drawing_batches(vision_response: str,
 
 def _process_component_based_plan(plan: Dict[str, Any], 
                                    target_width: int, 
-                                   target_height: int) -> List[Dict[str, Any]]:
+                                   target_height: int,
+                                   ref_width: int = None,
+                                   ref_height: int = None,
+                                   fit_mode: str = "contain") -> List[Dict[str, Any]]:
     """Process new component-based vision plan with normalized coordinates."""
     canvas = plan.get("canvas", {"width": target_width, "height": target_height})
     components = plan.get("components", [])
@@ -182,7 +240,7 @@ def _process_component_based_plan(plan: Dict[str, Any],
     # Process all strokes from all components
     all_strokes = []
     for component in components_sorted:
-        component_strokes = process_component_strokes(component, target_width, target_height)
+        component_strokes = process_component_strokes(component, target_width, target_height, ref_width, ref_height, fit_mode)
         all_strokes.extend(component_strokes)
         
         component_name = component.get("name", "unknown")

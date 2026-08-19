@@ -3,11 +3,13 @@ import traceback
 import time
 import os
 import json
+import re
 from pathlib import Path
 from config import config
 from mcp_client import KritaMCPClient
 from groq_agent import GroqAgent
 from vision_to_drawing import vision_plan_to_drawing_batches, create_drawing_plan_prompt
+from batch_manager import SmartBatchManager
 
 # Windows consoles may use cp1252; force UTF-8 with lossless replacement so
 # printing tool results (which may contain unicode) never crashes.
@@ -49,16 +51,43 @@ def _extract_points(stroke):
     return [[flat[i], flat[i + 1]] for i in range(0, len(flat) - 1, 2)]
 
 
-def _create_batches_from_extracted_geometry(extracted_geometry, target_width=800, target_height=600):
+def _create_batches_from_extracted_geometry(extracted_geometry, target_width=800, target_height=600, fit_mode="contain"):
     """Convert extracted computer vision geometry directly to drawing batches.
     
     This bypasses Groq coordinate generation and uses actual extracted contours.
     """
     strokes_data = extracted_geometry.get("strokes", [])
     regions_data = extracted_geometry.get("regions", [])
+    ref_width = extracted_geometry.get("width", target_width)
+    ref_height = extracted_geometry.get("height", target_height)
     
     if not strokes_data and not regions_data:
         return []
+        
+    # 1. PRESERVE ASPECT RATIO - Calculate UNIFORM scale
+    scale_x = target_width / ref_width
+    scale_y = target_height / ref_height
+    
+    if fit_mode == "contain":
+        scale = min(scale_x, scale_y)
+    elif fit_mode == "cover":
+        scale = max(scale_x, scale_y)
+    else:
+        scale = min(scale_x, scale_y) # Default to contain
+        
+    # 3. PRESERVE POSITIONING - Calculate translation offset to center it
+    scaled_w = ref_width * scale
+    scaled_h = ref_height * scale
+    offset_x = (target_width - scaled_w) / 2
+    offset_y = (target_height - scaled_h) / 2
+    
+    print("\n--- Geometry Transformation ---")
+    print(f"Reference: {ref_width} x {ref_height}")
+    print(f"Krita: {target_width} x {target_height}")
+    print(f"Fit mode: {fit_mode}")
+    print(f"Uniform scale: {scale:.4f}")
+    print(f"Offset: x = {offset_x:.1f}, y = {offset_y:.1f}")
+    print("-------------------------------\n")
     
     # Group strokes by (color, thickness) for efficient batching
     from collections import defaultdict
@@ -70,51 +99,62 @@ def _create_batches_from_extracted_geometry(extracted_geometry, target_width=800
         if len(normalized_points) < 2:
             continue
         
-        # Denormalize points to target canvas
+        # Denormalize points to target canvas using uniform scale
         canvas_points = []
         for norm_x, norm_y in normalized_points:
-            x = int(norm_x * target_width)
-            y = int(norm_y * target_height)
+            # First, recover original reference coordinates
+            ref_x = norm_x * ref_width
+            ref_y = norm_y * ref_height
+            
+            # Then apply uniform scale and offset
+            x = int(ref_x * scale + offset_x)
+            y = int(ref_y * scale + offset_y)
+            
             # Clamp to canvas
             x = max(0, min(target_width - 1, x))
             y = max(0, min(target_height - 1, y))
             canvas_points.append([x, y])
         
         color = stroke_data.get("color", "#000000")
-        thickness = stroke_data.get("thickness", 3)
+        
+        # 6. STROKE THICKNESS MUST SCALE WITH THE IMAGE
+        ref_thickness = stroke_data.get("thickness", 3)
+        # Apply uniform scale to thickness, ensure at least 1px
+        krita_thickness = max(1, int(round(ref_thickness * scale)))
         
         # Group by (color, thickness)
-        key = (color, thickness)
+        key = (color, krita_thickness)
         stroke_groups[key].append({
             "points": canvas_points,
             "closed": stroke_data.get("closed", False)
         })
     
-    # Process extracted regions (filled areas)
+    # Process extracted regions
     for region_data in regions_data:
         normalized_points = region_data.get("points", [])
         if len(normalized_points) < 3:
             continue
-        
-        # Denormalize points
+            
         canvas_points = []
         for norm_x, norm_y in normalized_points:
-            x = int(norm_x * target_width)
-            y = int(norm_y * target_height)
+            ref_x = norm_x * ref_width
+            ref_y = norm_y * ref_height
+            x = int(ref_x * scale + offset_x)
+            y = int(ref_y * scale + offset_y)
             x = max(0, min(target_width - 1, x))
             y = max(0, min(target_height - 1, y))
             canvas_points.append([x, y])
-        
+            
         color = region_data.get("color", "#808080")
-        thickness = 2  # Thin outline for filled regions
-        
-        key = (color, thickness)
+        # Regions typically need a thin boundary if drawn as strokes
+        krita_thickness = max(1, int(round(2 * scale)))
+        key = (color, krita_thickness)
         stroke_groups[key].append({
             "points": canvas_points,
             "closed": True
         })
     
-    # Create batches
+    # Convert groups to batches
     batches = []
     group_items = list(stroke_groups.items())
     
@@ -128,7 +168,7 @@ def _create_batches_from_extracted_geometry(extracted_geometry, target_width=800
             "complete": is_last
         }
         batches.append(batch)
-    
+        
     return batches
 
 
@@ -246,8 +286,10 @@ def main():
                 print("[INPUT] Waiting for reference instructions...")
                 print("What do you want me to do with this reference?")
                 print("Examples:")
-                print("  - Recreate this character accurately, preserving all details.")
-                print("  - Use this character but raise the right arm.")
+                print("  - Recreate this character accurately, preserving all details. (Trace Mode)")
+                print("  - Trace only the character and ignore the background. (Trace + AI Filter)")
+                print("  - Use this character but raise the right arm. (Hybrid Mode)")
+                print("  - Interpret and draw this in your own style. (AI Interpret Mode)")
                 print("  - Create two frames with this character waving.")
                 instruction = input("> ").strip()
                 
@@ -451,13 +493,33 @@ def main():
                     print("\nError: No visual geometry could be extracted from the reference image.")
                     print("The image may be blank, very low contrast, or in an unsupported format.")
                     return
+                # Determine Reference Mode
+                prompt_lower = prompt.lower() if prompt else ""
+                wants_trace = any(k in prompt_lower for k in ("trace", "accurate", "preserve", "exact", "copy", "recreate"))
+                wants_modify = any(k in prompt_lower for k in ("change", "modify", "remove", "add", "make", "raise", "move", "ignore", "only", "but"))
                 
-                # STEP 2: Use Groq Vision to interpret and organize the extracted geometry
-                print("\n--- Using Groq Vision for Interpretation ---")
-                print("Sending extracted geometry + reference image to Groq for organization...")
+                reference_mode = "ai_interpret"
+                if wants_trace and not wants_modify:
+                    reference_mode = "trace"
+                elif wants_trace and wants_modify:
+                    reference_mode = "trace_hybrid"
                 
-                # Create prompt that emphasizes Groq's role as interpreter, not generator
-                interpretation_prompt = f"""{prompt}
+                print(f"\n--- Selected Reference Mode: {reference_mode.upper()} ---")
+
+                if reference_mode == "trace":
+                    print("Using pure deterministic tracing (skipping Groq interpretation)...")
+                    vision_drawing_batches = _create_batches_from_extracted_geometry(
+                        extracted_geometry,
+                        target_width=800,
+                        target_height=600
+                    )
+                else:
+                    # STEP 2: Use Groq Vision to interpret and organize the extracted geometry
+                    print("\n--- Using Groq Vision for Interpretation ---")
+                    print("Sending extracted geometry + reference image to Groq for organization...")
+                    
+                    # Create prompt that emphasizes Groq's role as interpreter, not generator
+                    interpretation_prompt = f"""{prompt}
 
 IMPORTANT: The actual visual geometry has already been extracted from the reference image using computer vision.
 
@@ -484,23 +546,34 @@ Output format: JSON with components list, each containing:
 
 DO NOT invent new coordinates. Use the extracted geometry as the source of truth."""
 
-                vision_response = agent.analyze_image(reference_image_path, interpretation_prompt)
-                
-                print("\n--- Groq Interpretation (preview) ---")
-                preview = vision_response[:500] + "..." if len(vision_response) > 500 else vision_response
-                print(preview)
-                print()
-                
-                # STEP 3: Merge extracted geometry with Groq interpretation
-                print("\n--- Merging Extracted Geometry with Interpretation ---")
-                
-                # Convert extracted geometry directly to drawing batches
-                # Use Groq interpretation for organization hints if available
-                vision_drawing_batches = _create_batches_from_extracted_geometry(
-                    extracted_geometry,
-                    target_width=800,
-                    target_height=600
-                )
+                    vision_response = agent.analyze_image(reference_image_path, interpretation_prompt)
+                    
+                    print("\n--- Groq Interpretation (preview) ---")
+                    preview = vision_response[:500] + "..." if len(vision_response) > 500 else vision_response
+                    print(preview)
+                    print()
+                    
+                    # STEP 3: Merge extracted geometry with Groq interpretation
+                    print("\n--- Merging Extracted Geometry with Interpretation ---")
+                    
+                    # Convert Groq interpretation to drawing batches
+                    try:
+                        from vision_to_drawing import vision_plan_to_drawing_batches
+                        vision_drawing_batches = vision_plan_to_drawing_batches(
+                            vision_response,
+                            target_width=800,
+                            target_height=600,
+                            ref_width=extracted_geometry.get("width"),
+                            ref_height=extracted_geometry.get("height")
+                        )
+                    except Exception as e:
+                        print(f"Error parsing Groq vision plan: {e}")
+                        print("Falling back to raw extracted geometry batches...")
+                        vision_drawing_batches = _create_batches_from_extracted_geometry(
+                            extracted_geometry,
+                            target_width=800,
+                            target_height=600
+                        )
                 
                 if not vision_drawing_batches:
                     print("Error: Could not create drawing batches from extracted geometry.")
@@ -552,76 +625,18 @@ DO NOT invent new coordinates. Use the extracted geometry as the source of truth
         # IMAGE REFERENCE MODE: Execute vision-based drawing batches directly
         if vision_drawing_batches:
             print()
-            print("[MCP] Executing drawing from reference...")
+            print("[MCP] Executing drawing from reference using SmartBatchManager...")
             print()
-            for batch_idx, batch in enumerate(vision_drawing_batches):
-                batch_num = batch_idx + 1
-                print(f"\nExecuting batch {batch_num}/{len(vision_drawing_batches)}...")
-                print(f"  Color: {batch['color']}")
-                print(f"  Brush size: {batch['brush_size']}")
-                print(f"  Strokes: {len(batch['strokes'])}")
-                
-                stats["batches"] += 1
-                batch_results = []
-                
-                # Set color
-                color = batch.get("color")
-                if color:
-                    try:
-                        r = mcp_call("krita_set_color", {"color": color})
-                        batch_results.append({"action": "krita_set_color", "result": r})
-                        print(f"    Set color: {color}")
-                    except Exception as e:
-                        batch_results.append({"action": "krita_set_color", "error": str(e)})
-                        print(f"    Error setting color: {e}")
-                        traceback.print_exc()
-                
-                # Set brush size
-                brush_size = batch.get("brush_size")
-                if brush_size is not None:
-                    try:
-                        r = mcp_call("krita_set_brush", {"size": int(brush_size)})
-                        batch_results.append({"action": "krita_set_brush", "result": r})
-                        print(f"    Set brush size: {brush_size}")
-                    except Exception as e:
-                        batch_results.append({"action": "krita_set_brush", "error": str(e)})
-                        print(f"    Error setting brush: {e}")
-                        traceback.print_exc()
-                
-                # Draw all strokes
-                strokes = batch.get("strokes", [])
-                strokes_drawn = 0
-                for stroke_idx, stroke in enumerate(strokes):
-                    points = stroke.get("points", [])
-                    if len(points) < 2:
-                        batch_results.append({"action": "krita_stroke", "error": "Invalid points"})
-                        continue
-                    
-                    try:
-                        r = mcp_call("krita_stroke", {"points": points, "pressure": 1.0})
-                        batch_results.append({"action": "krita_stroke", "result": r})
-                        if "error" not in str(r).lower():
-                            strokes_drawn += 1
-                        
-                        # Progress indicator for large batches
-                        if (stroke_idx + 1) % 10 == 0 or stroke_idx == len(strokes) - 1:
-                            print(f"    Progress: {stroke_idx + 1}/{len(strokes)} strokes")
-                    except Exception as e:
-                        batch_results.append({"action": "krita_stroke", "error": str(e)})
-                        print(f"    Error drawing stroke {stroke_idx + 1}: {e}")
-                        traceback.print_exc()
-                
-                print(f"  Batch complete: {strokes_drawn}/{len(strokes)} strokes drawn")
+            
+            batch_manager = SmartBatchManager(mcp)
+            metrics = batch_manager.execute_plan(vision_drawing_batches)
+            
+            # Update stats for consistency (though metrics object has detailed stats)
+            stats["batches"] = metrics["total_batches_planned"]
+            stats["mcp_calls"] = metrics["mcp_requests"]
             
             print()
             print("[KRITA] Drawing operation completed.")
-            print()
-            print("="*60)
-            print("DRAWING COMPLETE")
-            print("="*60)
-            print(f"Total batches: {stats['batches']}")
-            print(f"Total MCP calls: {stats['mcp_calls']}")
-            print(f"Execution time: {time.time() - t_start:.2f}s")
             print("\nThe reference image has been recreated in Krita using actual drawing operations.")
             print("Check your Krita canvas to see the result.")
             return
@@ -744,58 +759,52 @@ DO NOT invent new coordinates. Use the extracted geometry as the source of truth
                             if isinstance(fn_args, str):
                                 args_obj = json.loads(fn_args)
                         except Exception:
-                            args_obj = fn_args
+                            if truncated and isinstance(fn_args, str):
+                                # Try to salvage the truncated JSON by closing arrays and objects
+                                s = fn_args.strip()
+                                # Remove trailing comma if present
+                                s = re.sub(r',\s*$', '', s)
+                                # Append closing brackets
+                                s += "]}]}"
+                                try:
+                                    args_obj = json.loads(s)
+                                    print("  [Auto-fixed truncated JSON for partial execution]")
+                                except Exception:
+                                    # Fallback simple fix
+                                    try:
+                                        s2 = fn_args.strip()
+                                        s2 = re.sub(r',\s*$', '', s2) + "]}"
+                                        args_obj = json.loads(s2)
+                                        print("  [Auto-fixed truncated JSON for partial execution (fallback)]")
+                                    except Exception:
+                                        args_obj = fn_args
+                            else:
+                                args_obj = fn_args
 
-                        stats["batches"] += 1
                         batch_results = []
+                        strokes_drawn = 0
                         color = None
                         brush_size = None
-                        strokes_drawn = 0
+                        
                         if isinstance(args_obj, dict):
                             color = args_obj.get("color")
-                            if color:
-                                try:
-                                    r = mcp_call("krita_set_color", {"color": color})
-                                    batch_results.append({"action": "krita_set_color", "result": r})
-                                    print("MCP →", r)
-                                except Exception as e:
-                                    batch_results.append({"action": "krita_set_color", "error": str(e)})
-                                    traceback.print_exc()
-
                             brush_size = args_obj.get("brush_size")
-                            if brush_size is not None:
-                                try:
-                                    r = mcp_call("krita_set_brush", {"size": int(brush_size)})
-                                    batch_results.append({"action": "krita_set_brush", "result": r})
-                                    print("MCP →", r)
-                                except Exception as e:
-                                    batch_results.append({"action": "krita_set_brush", "error": str(e)})
-                                    traceback.print_exc()
-
-                            strokes = args_obj.get("strokes") or []
-                            # Merge strokes that share an endpoint into a single
-                            # MCP call (identical pixels; the plugin blends with
-                            # max-alpha, so redrawing a joint is a no-op).
-                            merged = []
-                            for s in strokes:
-                                points = _extract_points(s)
-                                if len(points) < 2:
-                                    batch_results.append({"action": "krita_stroke", "error": "Invalid points"})
-                                    continue
-                                if merged and merged[-1][-1] == points[0]:
-                                    merged[-1].extend(points[1:])
-                                else:
-                                    merged.append(list(points))
-                            for points in merged:
-                                try:
-                                    r = mcp_call("krita_stroke", {"points": points, "pressure": 1.0})
-                                    batch_results.append({"action": "krita_stroke", "result": r})
-                                    print("MCP →", r)
-                                    if "error" not in str(r).lower():
-                                        strokes_drawn += 1
-                                except Exception as e:
-                                    batch_results.append({"action": "krita_stroke", "error": str(e)})
-                                    traceback.print_exc()
+                            
+                            batch_manager = SmartBatchManager(mcp)
+                            metrics = batch_manager.execute_plan([args_obj])
+                            
+                            stats["batches"] += metrics["total_batches_planned"]
+                            stats["mcp_calls"] += metrics["mcp_requests"]
+                            
+                            strokes_drawn = metrics["total_strokes"]
+                            batch_results = [{"action": "SmartBatchManager.execute_plan", "metrics": metrics}]
+                            
+                            if truncated:
+                                batch_results.append({
+                                    "warning": "Tool call was truncated due to length limits. I executed the partial plan. PLEASE EMIT A NEW krita_batch_draw CALL CONTINUING FROM WHERE YOU LEFT OFF. Do not repeat already drawn strokes."
+                                })
+                        else:
+                            batch_results = [{"error": "Invalid arguments for krita_batch_draw"}]
 
                         # Append a single tool result summarizing batch actions
                         messages.append({"role": "tool", "tool_call_id": tc_id, "content": str(batch_results)})

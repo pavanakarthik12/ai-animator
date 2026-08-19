@@ -38,14 +38,31 @@ def extract_contours_from_image(image_path: str,
         # Threshold to get strokes
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         
-        # Find contours
-        contours, hierarchy = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        # Find centerlines thickness using distance transform
+        dist_transform = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        
+        # Use RETR_TREE to get hierarchy, enabling deduplication of inner/outer boundaries
+        contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
         
         print(f"Found {len(contours)} raw contours in line art")
         
-        for contour in contours:
+        if hierarchy is not None:
+            hierarchy = hierarchy[0]
+            
+        for i, contour in enumerate(contours):
             if len(contour) < min_contour_points:
                 continue
+                
+            # 1. DEDUPLICATE OVERLAPPING GEOMETRY (INNER/OUTER BOUNDARIES)
+            # Only process outer boundaries (even depth in hierarchy) to prevent duplicate overlapping strokes
+            depth = 0
+            if hierarchy is not None:
+                parent = hierarchy[i][3]
+                while parent != -1:
+                    depth += 1
+                    parent = hierarchy[parent][3]
+            if depth % 2 != 0:
+                continue # Skip inner boundaries (holes)
             
             # Simplify contour slightly to remove noise but preserve shape
             epsilon = epsilon_factor * cv2.arcLength(contour, True)
@@ -65,16 +82,20 @@ def extract_contours_from_image(image_path: str,
             # Estimate if this is a closed contour
             start = approx[0][0]
             end = approx[-1][0]
-            dist = np.linalg.norm(start - end)
-            closed = dist < 10
+            closed_dist = np.linalg.norm(start - end)
+            closed = closed_dist < 10
             
-            # Estimate line thickness from contour area
-            area = cv2.contourArea(contour)
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter > 0:
-                thickness = max(2, min(8, int(area / perimeter * 2)))
-            else:
-                thickness = 3
+            # 2. ACCURATE LOCAL STROKE WIDTH (DISTANCE TRANSFORM)
+            # Do NOT use area/perimeter which incorrectly fills hollow shapes.
+            # Create mask for this contour to find max distance (actual local thickness)
+            mask = np.zeros(binary.shape, dtype=np.uint8)
+            cv2.drawContours(mask, [contour], -1, 255, -1)
+            
+            # Max distance transform under this contour gives accurate radius
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(dist_transform, mask=mask)
+            
+            # Krita brush size = diameter of the line
+            thickness = max(1, min(15, int(max_val * 2)))
             
             extracted_strokes.append({
                 "points": normalized_points,
@@ -85,15 +106,37 @@ def extract_contours_from_image(image_path: str,
     
     else:
         # Colored image processing
-        # Extract edges for line work
-        edges = cv2.Canny(gray, 50, 150)
-        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        # Extract dark strokes using adaptive thresholding to capture actual line width
+        adaptive_thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
         
-        print(f"Found {len(contours)} edge contours in colored image")
+        # Clean up noise
+        kernel = np.ones((2,2), np.uint8)
+        adaptive_thresh = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_OPEN, kernel)
         
-        for contour in contours:
+        # Distance transform for accurate local stroke width
+        dist_transform = cv2.distanceTransform(adaptive_thresh, cv2.DIST_L2, 5)
+        
+        # Use RETR_TREE to get hierarchy, enabling deduplication of inner/outer boundaries
+        contours, hierarchy = cv2.findContours(adaptive_thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        print(f"Found {len(contours)} stroke contours in colored image")
+        
+        if hierarchy is not None:
+            hierarchy = hierarchy[0]
+            
+        for i, contour in enumerate(contours):
             if len(contour) < min_contour_points:
                 continue
+                
+            # 1. DEDUPLICATE OVERLAPPING GEOMETRY
+            depth = 0
+            if hierarchy is not None:
+                parent = hierarchy[i][3]
+                while parent != -1:
+                    depth += 1
+                    parent = hierarchy[parent][3]
+            if depth % 2 != 0:
+                continue # Skip inner boundaries
             
             epsilon = epsilon_factor * cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, epsilon, False)
@@ -107,6 +150,18 @@ def extract_contours_from_image(image_path: str,
                 norm_x = float(x) / width
                 norm_y = float(y) / height
                 normalized_points.append([norm_x, norm_y])
+                
+            # Estimate if this is a closed contour
+            start = approx[0][0]
+            end = approx[-1][0]
+            closed_dist = np.linalg.norm(start - end)
+            closed = closed_dist < 10
+            
+            # 2. ACCURATE LOCAL STROKE WIDTH (DISTANCE TRANSFORM)
+            mask = np.zeros(adaptive_thresh.shape, dtype=np.uint8)
+            cv2.drawContours(mask, [contour], -1, 255, -1)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(dist_transform, mask=mask)
+            thickness = max(1, min(15, int(max_val * 2)))
             
             # Sample color along the contour
             mid_idx = len(approx) // 2
@@ -114,14 +169,17 @@ def extract_contours_from_image(image_path: str,
             x, y = int(x), int(y)
             if 0 <= y < height and 0 <= x < width:
                 b, g, r = img[y, x]
+                # Check if it's very light, if so it might be a false positive or just highlight
+                if np.mean([b,g,r]) > 230:
+                    continue
                 color = f"#{r:02x}{g:02x}{b:02x}"
             else:
                 color = "#000000"
             
             extracted_strokes.append({
                 "points": normalized_points,
-                "closed": False,
-                "thickness": 3,
+                "closed": closed,
+                "thickness": thickness,
                 "color": color,
                 "point_count": len(normalized_points)
             })

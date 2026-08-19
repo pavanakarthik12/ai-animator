@@ -142,6 +142,9 @@ Extract head,eyes,nose,mouth,hair,body,arms,legs. Coords 0-1. 15+ pts/curve."""
         
         print(f"Sending image to Groq Vision ({self.vision_model})...")
         
+        full_content = ""
+        is_json_mode = True
+        
         try:
             # Try with JSON mode first
             resp = self._post_with_retry(
@@ -155,6 +158,7 @@ Extract head,eyes,nose,mouth,hair,body,arms,legs. Coords 0-1. 15+ pts/curve."""
             error_msg = str(e)
             if "json_validate_failed" in error_msg or "Failed to validate JSON" in error_msg:
                 print("JSON mode failed, retrying without JSON mode constraint...")
+                is_json_mode = False
                 # Retry without JSON mode - rely on extraction
                 resp = self._post_with_retry(
                     model=self.vision_model,
@@ -166,5 +170,47 @@ Extract head,eyes,nose,mouth,hair,body,arms,legs. Coords 0-1. 15+ pts/curve."""
                 raise
         
         content = resp.choices[0].message.content
+        full_content += content
+        finish_reason = resp.choices[0].finish_reason
+        
+        # Continuation loop if response is truncated
+        continuation_count = 0
+        max_continuations = 5
+        
+        while finish_reason == "length" and continuation_count < max_continuations:
+            print(f"Response truncated. Requesting continuation {continuation_count + 1}/{max_continuations}...")
+            
+            # Append the assistant's partial response
+            messages.append({"role": "assistant", "content": content})
+            
+            # Ask it to continue exactly where it left off
+            messages.append({
+                "role": "user",
+                "content": "Your previous response was truncated due to length limits. Please continue EXACTLY where you left off. Do not repeat anything you've already output, and do not start a new JSON object. Just output the continuation."
+            })
+            
+            # We must drop JSON mode for continuations since the continuation is just a fragment, not a valid JSON object by itself
+            resp = self._post_with_retry(
+                model=self.vision_model,
+                messages=messages,
+                max_completion_tokens=2000,
+                temperature=0.1
+            )
+            
+            content = resp.choices[0].message.content
+            # Sometimes models prepend a codeblock markdown to continuations
+            clean_content = content
+            if clean_content.startswith("```json\n"):
+                clean_content = clean_content[8:]
+            elif clean_content.startswith("```\n"):
+                clean_content = clean_content[4:]
+                
+            full_content += clean_content
+            finish_reason = resp.choices[0].finish_reason
+            continuation_count += 1
+            
+        if finish_reason == "length":
+            print("Warning: Reached maximum continuations. Plan may still be truncated.")
+            
         print("Vision analysis complete.")
-        return content
+        return full_content

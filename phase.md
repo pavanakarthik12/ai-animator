@@ -355,4 +355,4 @@ FRAME 0 | FRAME 1
 
 with different drawings actually present on each frame.
 
-Do not claim success unless you can verify that the drawings exist on separate Krita keyframes.
+Do not claim success unless you can verify that the drawings exist on separate Krita keyframes
