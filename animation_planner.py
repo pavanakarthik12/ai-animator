@@ -175,31 +175,173 @@ class LinearBlendSkinning:
             
         return deformed_strokes
 
+class WalkConfig:
+    STRIDE_LENGTH = 0.15      # Fraction of leg length (conservative for front-facing)
+    STEP_HEIGHT = 0.10        # Fraction of leg length
+    HIP_SHIFT_X = 0.02        # Small horizontal weight shift
+    BODY_BOB_Y = 0.04         # Small vertical bob
+    ARM_SWING = 0.2           # Conservative arm swing
+
+def solve_2d_ik(root_pos, target_pos, l1, l2, flip_knee=False):
+    dx = target_pos[0] - root_pos[0]
+    dy = target_pos[1] - root_pos[1]
+    dist = math.hypot(dx, dy)
+    
+    if dist > l1 + l2: dist = l1 + l2 - 0.001
+    if dist < abs(l1 - l2): dist = abs(l1 - l2) + 0.001
+        
+    val = (l1*l1 + l2*l2 - dist*dist) / (2 * l1 * l2)
+    val = max(-1.0, min(1.0, val))
+    knee_inner_angle = math.acos(val)
+    
+    val2 = (l1*l1 + dist*dist - l2*l2) / (2 * l1 * dist)
+    val2 = max(-1.0, min(1.0, val2))
+    alpha = math.acos(val2)
+    
+    base_angle = math.atan2(dy, dx)
+    
+    if flip_knee:
+        angle1 = base_angle + alpha
+        angle2 = angle1 - math.pi + knee_inner_angle
+    else:
+        angle1 = base_angle - alpha
+        angle2 = angle1 + math.pi - knee_inner_angle
+        
+    return angle1, angle2
+
 class PoseInterpolator:
     @staticmethod
-    def interpolate(keyframes: List[Dict[str, float]], num_frames: int = 20) -> List[Dict[str, float]]:
+    def interpolate(keyframes: List[Dict[str, float]], num_frames: int = 20, rig: CharacterRig = None) -> List[Dict[str, float]]:
+        if not rig:
+            # Fallback to linear
+            frames = []
+            num_keys = len(keyframes)
+            for i in range(num_frames):
+                cycle_pos = (i / num_frames) * num_keys
+                k1_idx = int(math.floor(cycle_pos)) % num_keys
+                k2_idx = (k1_idx + 1) % num_keys
+                t = cycle_pos - math.floor(cycle_pos)
+                k1 = keyframes[k1_idx]
+                k2 = keyframes[k2_idx]
+                interp = {}
+                all_joints = set(k1.keys()) | set(k2.keys())
+                for joint in all_joints:
+                    if joint == "name": continue
+                    interp[joint] = float(k1.get(joint, 0.0)) + (float(k2.get(joint, 0.0)) - float(k1.get(joint, 0.0))) * t
+                frames.append(interp)
+            return frames
+
+        # --- Procedural Walk Cycle using IK ---
         frames = []
-        num_keys = len(keyframes)
+        
+        # 1. Analyze Rig Dimensions
+        l_thigh = rig.rest_lengths.get("knee_l", 0)
+        l_calf = rig.rest_lengths.get("foot_l", 0)
+        r_thigh = rig.rest_lengths.get("knee_r", 0)
+        r_calf = rig.rest_lengths.get("foot_r", 0)
+        
+        l_leg = l_thigh + l_calf
+        r_leg = r_thigh + r_calf
+        avg_leg = (l_leg + r_leg) / 2.0
+        if avg_leg == 0: avg_leg = 1.0 # fallback
+        
+        stride = WalkConfig.STRIDE_LENGTH * avg_leg
+        step_h = WalkConfig.STEP_HEIGHT * avg_leg
+        bob_y = WalkConfig.BODY_BOB_Y * avg_leg
+        
+        # We need the global rest positions of hips and feet to know baseline
+        # Assume root is (0,0) in local space, get_global_transforms uses local_angles=0
+        rest_globals = rig.get_global_transforms()
+        l_hip_pos = rest_globals.get("hip_l", (0,0,0))
+        r_hip_pos = rest_globals.get("hip_r", (0,0,0))
+        l_foot_pos = rest_globals.get("foot_l", (0,0,0))
+        r_foot_pos = rest_globals.get("foot_r", (0,0,0))
+        
+        ground_y = max(l_foot_pos[1], r_foot_pos[1])
+        
+        print("\n============================================================")
+        print("DEBUG MODE: WALK CYCLE FOOT TRAJECTORY TABLE")
+        print("Frame | Left Foot | Right Foot | Left Knee | Right Knee | Hip | Phase")
+        print("------------------------------------------------------------")
         
         for i in range(num_frames):
-            cycle_pos = (i / num_frames) * num_keys
-            k1_idx = int(math.floor(cycle_pos)) % num_keys
-            k2_idx = (k1_idx + 1) % num_keys
-            t = cycle_pos - math.floor(cycle_pos)
+            phase = i / num_frames # 0.0 to 1.0
             
-            k1 = keyframes[k1_idx]
-            k2 = keyframes[k2_idx]
+            # Root bobbing: Contact->Down(lowest)->Passing(mid)->Up(highest)->Contact
+            # Let's map 0..0.5 to a curve:
+            # 0.0: 0
+            # 0.15: +bob_y (Down)
+            # 0.25: 0 (Passing)
+            # 0.35: -bob_y (Up)
+            # 0.5: 0
+            # This is roughly: bob_y * math.sin(phase * 4 * math.pi)
+            root_y_shift = math.sin(phase * 4 * math.pi) * bob_y
             
-            interp = {}
-            # Ensure all joints get interpolated
-            all_joints = set(k1.keys()) | set(k2.keys())
-            for joint in all_joints:
-                if joint == "name":
-                    continue
-                v1 = float(k1.get(joint, 0.0))
-                v2 = float(k2.get(joint, 0.0))
-                interp[joint] = v1 + (v2 - v1) * t
+            # Left foot (contact 0-0.5, swing 0.5-1.0)
+            if phase < 0.5:
+                l_foot_x = l_hip_pos[0] + stride * (0.5 - (phase / 0.5))
+                l_foot_y = ground_y
+                l_state = "contact"
+            else:
+                swing_p = (phase - 0.5) / 0.5
+                l_foot_x = l_hip_pos[0] - stride + (stride * 2) * swing_p
+                l_foot_y = ground_y - math.sin(swing_p * math.pi) * step_h
+                l_state = "swing"
                 
-            frames.append(interp)
+            # Right foot (swing 0-0.5, contact 0.5-1.0)
+            if phase < 0.5:
+                swing_p = phase / 0.5
+                r_foot_x = r_hip_pos[0] - stride + (stride * 2) * swing_p
+                r_foot_y = ground_y - math.sin(swing_p * math.pi) * step_h
+                r_state = "swing"
+            else:
+                r_foot_x = r_hip_pos[0] + stride * (0.5 - ((phase - 0.5) / 0.5))
+                r_foot_y = ground_y
+                r_state = "contact"
+
+            # Apply IK
+            # IK is relative to current hip positions (which bob with root)
+            l_hip_curr = (l_hip_pos[0], l_hip_pos[1] + root_y_shift)
+            r_hip_curr = (r_hip_pos[0], r_hip_pos[1] + root_y_shift)
             
+            # Left knee bends LEFT (flip_knee=True), Right knee bends RIGHT (flip_knee=False)
+            l_angle1, l_angle2 = solve_2d_ik(l_hip_curr, (l_foot_x, l_foot_y), l_thigh, l_calf, flip_knee=True)
+            r_angle1, r_angle2 = solve_2d_ik(r_hip_curr, (r_foot_x, r_foot_y), r_thigh, r_calf, flip_knee=False)
+            
+            l_hip_local = l_angle1 - rig.rest_angles.get("knee_l", 0)
+            r_hip_local = r_angle1 - rig.rest_angles.get("knee_r", 0)
+            l_knee_local = (l_angle2 - rig.rest_angles.get("foot_l", 0)) - (l_angle1 - rig.rest_angles.get("knee_l", 0))
+            r_knee_local = (r_angle2 - rig.rest_angles.get("foot_r", 0)) - (r_angle1 - rig.rest_angles.get("knee_r", 0))
+            
+            # Arms (FK oscillation)
+            arm_angle = math.cos(phase * math.pi * 2) * WalkConfig.ARM_SWING
+            
+            angles = {
+                "root_y": root_y_shift, # Now directly in pixels
+                "root_x": 0.0,
+                "hip_l": l_hip_local,
+                "knee_l": l_knee_local,
+                "hip_r": r_hip_local,
+                "knee_r": r_knee_local,
+                "shoulder_l": arm_angle,
+                "shoulder_r": -arm_angle,
+                "elbow_l": abs(arm_angle) * 0.5,
+                "elbow_r": abs(arm_angle) * 0.5,
+                "torso": 0.0,
+                "neck": 0.0,
+                "head": 0.0
+            }
+            frames.append(angles)
+            
+            # Phase Name
+            cycle_p = phase % 0.5
+            if cycle_p < 0.05 or cycle_p > 0.45: phase_name = "CONTACT"
+            elif cycle_p < 0.2: phase_name = "DOWN"
+            elif cycle_p < 0.35: phase_name = "PASSING"
+            else: phase_name = "UP"
+            
+            print(f"{i+1:02d} | {l_state:7s} | {r_state:7s} | {l_knee_local:+.2f} | {r_knee_local:+.2f} | {root_y_shift:+.1f} | {phase_name}")
+            
+        print("============================================================\n")
+        
         return frames

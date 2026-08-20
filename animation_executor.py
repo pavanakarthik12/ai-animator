@@ -4,15 +4,59 @@ from animation_planner import CharacterRig, LinearBlendSkinning, PoseInterpolato
 from groq_animation import analyze_character_rig, plan_walk_cycle
 from batch_manager import SmartBatchManager
 
+
+class PerformanceProfiler:
+    """Track timing for each stage of the animation pipeline."""
+    def __init__(self):
+        self.timings = {}
+        self.current_stage = None
+        self.stage_start = None
+    
+    def start(self, stage_name):
+        if self.current_stage:
+            self.end()
+        self.current_stage = stage_name
+        self.stage_start = time.time()
+    
+    def end(self):
+        if self.current_stage and self.stage_start:
+            elapsed = time.time() - self.stage_start
+            if self.current_stage in self.timings:
+                self.timings[self.current_stage] += elapsed
+            else:
+                self.timings[self.current_stage] = elapsed
+            self.current_stage = None
+            self.stage_start = None
+    
+    def print_report(self):
+        self.end()  # End any active stage
+        print("\n" + "="*60)
+        print("[PERF] PERFORMANCE BREAKDOWN")
+        print("="*60)
+        total = sum(self.timings.values())
+        for stage, duration in sorted(self.timings.items(), key=lambda x: -x[1]):
+            pct = (duration / total * 100) if total > 0 else 0
+            print(f"{stage:25s}: {duration:6.2f}s ({pct:5.1f}%)")
+        print("-"*60)
+        print(f"{'TOTAL':25s}: {total:6.2f}s")
+        print("="*60)
+
+
 def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref_path: str, target_width=800, target_height=600, fit_mode="contain"):
+    profiler = PerformanceProfiler()
+    pipeline_start = time.time()
+    
     print("\n" + "="*60)
     print("WALK CYCLE ANIMATION PIPELINE STARTED")
     print("="*60)
     
     # 1. Analyze character to get rest pose joints
+    profiler.start("Groq character analysis")
     rest_joints_norm = analyze_character_rig(agent, ref_path)
+    profiler.end()
     
     # 2. De-normalize joints to match canvas scaling
+    profiler.start("Geometry scaling")
     ref_w = extracted_geometry.get("width", target_width)
     ref_h = extracted_geometry.get("height", target_height)
     
@@ -27,22 +71,29 @@ def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref
         x = nx * ref_w * scale + offset_x
         y = ny * ref_h * scale + offset_y
         rest_joints[j] = (x, y)
+    profiler.end()
         
     print(f"\n[ANIM] Extracted {len(rest_joints)} joints for rest pose.")
     
     # 3. Plan Walk Cycle Keyframes
+    profiler.start("Groq walk planning")
     keyframes = plan_walk_cycle(agent, rest_joints_norm)
+    profiler.end()
     
-    # 4. Interpolate 20 frames
-    frames_angles = PoseInterpolator.interpolate(keyframes, 20)
-    print(f"\n[ANIM] Interpolated {len(frames_angles)} frames of animation.")
+    # Instantiate rig early for procedural walk cycle generation
+    profiler.start("Rig initialization")
+    rig = CharacterRig(rest_joints)
+    profiler.end()
+    
+    # 4. Interpolate 20 frames using IK / procedural generator
+    profiler.start("Pose interpolation")
+    frames_angles = PoseInterpolator.interpolate(keyframes, 20, rig)
+    profiler.end()
+    print(f"\n[ANIM] Generated {len(frames_angles)} frames of procedural animation.")
     
     # 5. Extract rest pose strokes (already normalized in extracted_geometry)
+    profiler.start("Batch preparation")
     from main import _create_batches_from_extracted_geometry
-    # We use _create_batches_from_extracted_geometry to get the base canvas coordinates
-    # We don't batch them yet, we just want the flattened list of strokes
-    # Actually, _create_batches_from_extracted_geometry returns batches.
-    # We can unwrap them.
     batches = _create_batches_from_extracted_geometry(extracted_geometry, target_width, target_height, fit_mode)
     
     all_strokes = []
@@ -56,18 +107,21 @@ def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref
                 "closed": s.get("closed", False)
             }
             all_strokes.append(stroke_obj)
+    profiler.end()
             
     print(f"\n[ANIM] Found {len(all_strokes)} strokes to bind to rig.")
     
     # 6. Bind strokes to rig
-    rig = CharacterRig(rest_joints)
+    profiler.start("LBS binding")
     skinning = LinearBlendSkinning(rig, all_strokes)
+    profiler.end()
     print("[ANIM] LBS Binding complete.")
     
     # 7. Execute 20 frames in Krita
     batch_manager = SmartBatchManager(mcp)
     
     # Select paint layer
+    profiler.start("MCP setup")
     try:
         mcp.call_tool("krita_select_paint_layer", {}, timeout=10)
     except Exception as e:
@@ -78,12 +132,15 @@ def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref
         mcp.call_tool("krita_enable_onion", {"enabled": True}, timeout=10)
     except Exception as e:
         print(f"Warning: enable onion skin failed: {e}")
+    profiler.end()
         
     for frame_idx, angles in enumerate(frames_angles):
         krita_frame = frame_idx + 1
-        print(f"\n--- Drawing Frame {krita_frame}/20 ---")
+        print(f"\n[FRAME {krita_frame}/20]")
+        print(f"Creating/selecting frame {krita_frame}")
         
         # Create keyframe and select frame with validation
+        profiler.start("Frame creation")
         max_retries = 3
         frame_ready = False
         
@@ -103,46 +160,35 @@ def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref
             # 3. Verify current frame
             try:
                 current_frame_result = mcp.call_tool("krita_get_current_frame", {}, timeout=10)
-                # Parse current frame from dict
                 actual_frame = current_frame_result.get("current_frame", -1) if isinstance(current_frame_result, dict) else -1
                 
-                print(f"[FRAME {krita_frame}/20] Target frame: {krita_frame}")
-                print(f"[FRAME {krita_frame}/20] Krita current frame: {actual_frame}")
+                print(f"Krita current frame = {actual_frame}")
                 
                 if actual_frame == krita_frame:
                     frame_ready = True
                     break
                 else:
-                    print(f"Frame validation failed (expected {krita_frame}, got {actual_frame}). Retrying...")
+                    print(f"Frame validation failed. Retrying...")
                     time.sleep(1)
             except Exception as e:
                 print(f"Warning: get current frame failed: {e}")
                 time.sleep(1)
+        profiler.end()
                 
         if not frame_ready:
-            print(f"Fatal: Could not select/verify frame {krita_frame}. Stopping animation.")
+            print(f"Fatal: requested frame != actual Krita frame. DO NOT DRAW.")
             break
             
-        print(f"[FRAME {krita_frame}/20] Clearing frame...")
-        try:
-            # Clear canvas so we don't draw over the duplicated keyframe
-            mcp.call_tool("krita_clear", {"color": "#ffffff"}, timeout=10)
-        except Exception as e:
-            print(f"Warning: failed to clear frame: {e}")
-            
-        print(f"[FRAME {krita_frame}/20] Drawing...")
+        print(f"Drawing frame {krita_frame}")
         
         # Deform geometry
-        # Fix vertical bouncing: root_y is absolute addition, we want it scaled
-        if "root_y" in angles:
-            angles["root_y"] = angles["root_y"] * ref_h * scale
-        if "root_x" in angles:
-            angles["root_x"] = angles["root_x"] * ref_w * scale
-            
+        profiler.start("Geometry deformation")
         rig.set_pose(angles)
         deformed_strokes = skinning.deform()
+        profiler.end()
         
         # Group back into batches
+        profiler.start("Batch grouping")
         from collections import defaultdict
         grouped = defaultdict(list)
         for s in deformed_strokes:
@@ -163,10 +209,19 @@ def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref
             })
         if frame_batches:
             frame_batches[-1]["complete"] = True
+        profiler.end()
             
         # Draw!
+        profiler.start("MCP drawing")
         batch_manager.execute_plan(frame_batches)
-        
+        profiler.end()
+        print(f"Frame {krita_frame} drawing complete")
+    
+    pipeline_total = time.time() - pipeline_start
+    
     print("\n" + "="*60)
     print("WALK CYCLE ANIMATION COMPLETE")
     print("="*60)
+    print(f"Total pipeline time: {pipeline_total:.2f}s")
+    
+    profiler.print_report()
