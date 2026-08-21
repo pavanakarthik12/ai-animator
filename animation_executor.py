@@ -42,13 +42,14 @@ class PerformanceProfiler:
         print("="*60)
 
 
-def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref_path: str, target_width=800, target_height=600, fit_mode="contain"):
+def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref_path: str, frame_count: int = 240, target_width=800, target_height=600, fit_mode="contain"):
     profiler = PerformanceProfiler()
     pipeline_start = time.time()
     
     print("\n" + "="*60)
     print("WALK CYCLE ANIMATION PIPELINE STARTED")
     print("="*60)
+    print(f"Requested frame count: {frame_count}")
     
     # 1. Analyze character to get rest pose joints
     profiler.start("Groq character analysis")
@@ -85,9 +86,9 @@ def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref
     rig = CharacterRig(rest_joints)
     profiler.end()
     
-    # 4. Interpolate 20 frames using IK / procedural generator
+    # 4. Interpolate frames using IK / procedural generator
     profiler.start("Pose interpolation")
-    frames_angles = PoseInterpolator.interpolate(keyframes, 20, rig)
+    frames_angles = PoseInterpolator.interpolate(keyframes, frame_count, rig)
     profiler.end()
     print(f"\n[ANIM] Generated {len(frames_angles)} frames of procedural animation.")
     
@@ -117,7 +118,7 @@ def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref
     profiler.end()
     print("[ANIM] LBS Binding complete.")
     
-    # 7. Execute 20 frames in Krita
+    # 7. Execute frames in Krita
     batch_manager = SmartBatchManager(mcp)
     
     # Select paint layer
@@ -134,9 +135,10 @@ def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref
         print(f"Warning: enable onion skin failed: {e}")
     profiler.end()
         
+    total_frames = len(frames_angles)
     for frame_idx, angles in enumerate(frames_angles):
         krita_frame = frame_idx + 1
-        print(f"\n[FRAME {krita_frame}/20]")
+        print(f"\n[FRAME {krita_frame}/{total_frames}]")
         print(f"Creating/selecting frame {krita_frame}")
         
         # Create keyframe and select frame with validation

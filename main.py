@@ -1002,11 +1002,21 @@ def main():
                         print("No existing reference loaded. Creating text-based character.")
             
             elif choice == "3":
-                frames = input("Walk cycle length [20]:\n> ").strip()
-                if not frames: frames = "20"
+                frames = input("Animation frame count [240]:\n> ").strip()
+                if not frames:
+                    frames = "240"
                 
-                req_prompt = f"Create a {frames} frame walk cycle."
-                print(f"Creating {frames}-frame walk cycle...")
+                try:
+                    frame_count = int(frames)
+                    if frame_count <= 0:
+                        print("Frame count must be positive. Using default: 240")
+                        frame_count = 240
+                except ValueError:
+                    print("Invalid frame count. Using default: 240")
+                    frame_count = 240
+                
+                req_prompt = f"Create a {frame_count} frame walk cycle."
+                print(f"Creating {frame_count}-frame walk cycle...")
                 
                 # Walk cycle logic
                 from animation_executor import run_walk_cycle_animation
@@ -1016,7 +1026,7 @@ def main():
                     print("Extracting geometry for walk cycle...")
                     extracted = extract_contours_from_image(current_character_path, min_contour_points=3, epsilon_factor=0.002)
                     if extracted['total_elements'] > 0:
-                        run_walk_cycle_animation(agent, mcp, extracted, current_character_path)
+                        run_walk_cycle_animation(agent, mcp, extracted, current_character_path, frame_count=frame_count)
                     else:
                         print("Could not extract geometry from character.")
                 else:
