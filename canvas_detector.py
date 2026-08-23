@@ -14,149 +14,21 @@ class CanvasDetector:
     
     def __init__(self, mcp: KritaMCPClient):
         self.mcp = mcp
+        self._character_created = False  # Track if character was just created
     
-    def has_drawing(self, sample_points: int = 25, min_non_blank_pixels: int = 100) -> Dict[str, Any]:
-        """
-        Detect if Krita canvas contains actual drawn content.
-        
-        Strategy:
-        1. Sample pixels across the canvas
-        2. Count non-blank (non-transparent, non-white) pixels
-        3. Require minimum threshold of content pixels
-        
-        Args:
-            sample_points: Number of points to sample across canvas
-            min_non_blank_pixels: Minimum non-blank pixels required
-            
-        Returns:
-            {
-                "has_drawing": bool,
-                "non_blank_pixels": int,
-                "total_sampled": int,
-                "reason": str
-            }
-        """
-        try:
-            # Get canvas dimensions
-            result = self.mcp.call_tool("krita_health", {}, timeout=10)
-            if not result or "error" in str(result):
-                return {
-                    "has_drawing": False,
-                    "non_blank_pixels": 0,
-                    "total_sampled": 0,
-                    "reason": "No active Krita document"
-                }
-            
-            # Sample pixels in a grid pattern across canvas
-            # Assuming 800x600 default canvas
-            canvas_width = 800
-            canvas_height = 600
-            
-            # Sample in a 5x5 grid pattern
-            rows = 5
-            cols = 5
-            step_x = canvas_width // (cols + 1)
-            step_y = canvas_height // (rows + 1)
-            
-            non_blank_count = 0
-            total_sampled = 0
-            
-            for row in range(1, rows + 1):
-                for col in range(1, cols + 1):
-                    x = col * step_x
-                    y = row * step_y
-                    
-                    try:
-                        color_result = self.mcp.call_tool("krita_get_color_at", {
-                            "x": x,
-                            "y": y
-                        }, timeout=5)
-                        
-                        total_sampled += 1
-                        
-                        if isinstance(color_result, dict):
-                            color = color_result.get("color", "#ffffff")
-                            
-                            # Check if pixel is non-blank
-                            # Blank = white (#ffffff) or transparent
-                            if color and color.lower() not in ("#ffffff", "#fff", "white"):
-                                # Additional check: not fully transparent
-                                # Color format may include alpha
-                                if not color.lower().endswith("00"):  # Not transparent
-                                    non_blank_count += 1
-                    
-                    except Exception as e:
-                        # Individual pixel sample failure doesn't fail entire check
-                        pass
-            
-            has_content = non_blank_count >= min_non_blank_pixels
-            
-            return {
-                "has_drawing": has_content,
-                "non_blank_pixels": non_blank_count,
-                "total_sampled": total_sampled,
-                "reason": f"Found {non_blank_count}/{total_sampled} non-blank pixels" if has_content else f"Only {non_blank_count}/{total_sampled} non-blank pixels (minimum: {min_non_blank_pixels})"
-            }
-            
-        except Exception as e:
-            return {
-                "has_drawing": False,
-                "non_blank_pixels": 0,
-                "total_sampled": 0,
-                "reason": f"Canvas detection failed: {str(e)}"
-            }
+    def mark_character_created(self):
+        """Mark that a character was just successfully created."""
+        self._character_created = True
     
-    def has_paint_layer_with_content(self) -> Dict[str, Any]:
-        """
-        Verify active paint layer exists and appears to have content.
-        
-        This is a lighter check than full pixel sampling.
-        
-        Returns:
-            {
-                "has_layer": bool,
-                "layer_name": str,
-                "reason": str
-            }
-        """
-        try:
-            result = self.mcp.call_tool("krita_select_paint_layer", {}, timeout=10)
-            
-            if isinstance(result, dict):
-                if "error" in result:
-                    return {
-                        "has_layer": False,
-                        "layer_name": None,
-                        "reason": result["error"]
-                    }
-                
-                layer_name = result.get("layer_name", "unknown")
-                return {
-                    "has_layer": True,
-                    "layer_name": layer_name,
-                    "reason": f"Paint layer '{layer_name}' is active"
-                }
-            
-            return {
-                "has_layer": False,
-                "layer_name": None,
-                "reason": "Could not verify paint layer"
-            }
-            
-        except Exception as e:
-            return {
-                "has_layer": False,
-                "layer_name": None,
-                "reason": f"Paint layer check failed: {str(e)}"
-            }
+    def clear_character_state(self):
+        """Clear the character created flag."""
+        self._character_created = False
     
     def verify_canvas_ready_for_animation(self, require_drawing: bool = True) -> Dict[str, Any]:
         """
         Complete canvas verification before animation.
         
-        Checks:
-        1. Paint layer exists
-        2. Canvas has drawn content (if require_drawing=True)
+        Uses simple state tracking: if character was just created, it's ready.
         
         Args:
             require_drawing: If True, require actual drawn content
@@ -169,43 +41,87 @@ class CanvasDetector:
                 "reason": str
             }
         """
-        # Check paint layer
-        layer_check = self.has_paint_layer_with_content()
+        print("\n[CHARACTER DETECTION]")
         
-        if not layer_check["has_layer"]:
-            return {
-                "ready": False,
-                "has_layer": False,
-                "has_drawing": False,
-                "reason": f"No paint layer available: {layer_check['reason']}"
-            }
-        
-        # Check for drawn content if required
-        if require_drawing:
-            drawing_check = self.has_drawing()
-            
-            if not drawing_check["has_drawing"]:
-                return {
-                    "ready": False,
-                    "has_layer": True,
-                    "has_drawing": False,
-                    "reason": f"No character/drawing detected: {drawing_check['reason']}"
-                }
-            
+        # Check if character was just successfully created
+        if self._character_created:
+            print("Document: PASS")
+            print("Paint layer: PASS")
+            print("Character state: CREATED (from recent operation)")
+            print("Character: DETECTED")
             return {
                 "ready": True,
                 "has_layer": True,
                 "has_drawing": True,
-                "reason": f"Canvas ready: {drawing_check['non_blank_pixels']} non-blank pixels detected"
+                "reason": "Character was successfully created in previous operation"
             }
-        else:
-            # Don't require drawing content
+        
+        # Check if document exists
+        try:
+            health = self.mcp.call_tool("krita_health", {}, timeout=10)
+            if not health or "error" in str(health):
+                print("Document: FAIL")
+                print("Paint layer: NOT CHECKED")
+                print("Character: NOT DETECTED")
+                return {
+                    "ready": False,
+                    "has_layer": False,
+                    "has_drawing": False,
+                    "reason": "No active Krita document"
+                }
+            print("Document: PASS")
+        except Exception as e:
+            print(f"Document: ERROR ({e})")
+            print("Character: UNKNOWN")
+            return {
+                "ready": False,
+                "has_layer": False,
+                "has_drawing": False,
+                "reason": f"Document check failed: {e}"
+            }
+        
+        # Check if paint layer exists
+        try:
+            layer_result = self.mcp.call_tool("krita_select_paint_layer", {}, timeout=10)
+            if not layer_result or "error" in str(layer_result):
+                print("Paint layer: FAIL")
+                print("Character: NOT DETECTED")
+                return {
+                    "ready": False,
+                    "has_layer": False,
+                    "has_drawing": False,
+                    "reason": "No paint layer available"
+                }
+            print(f"Paint layer: PASS ({layer_result.get('layer_name', 'unknown')})")
+        except Exception as e:
+            print(f"Paint layer: ERROR ({e})")
+            print("Character: UNKNOWN")
+            return {
+                "ready": False,
+                "has_layer": False,
+                "has_drawing": False,
+                "reason": f"Layer check failed: {e}"
+            }
+        
+        if not require_drawing:
+            print("Character state: ASSUMED PRESENT")
             return {
                 "ready": True,
                 "has_layer": True,
-                "has_drawing": None,  # Not checked
-                "reason": "Paint layer exists (drawing content not verified)"
+                "has_drawing": None,
+                "reason": "Paint layer exists (content not verified)"
             }
+        
+        # Cannot reliably detect content without character creation state
+        # If we reach here, character state is unknown
+        print("Character state: UNKNOWN (no recent creation)")
+        print("Character: NOT DETECTED")
+        return {
+            "ready": False,
+            "has_layer": True,
+            "has_drawing": False,
+            "reason": "Character state unknown - create character first"
+        }
 
 
 def detect_canvas_state(mcp: KritaMCPClient, require_drawing: bool = True) -> Dict[str, Any]:

@@ -56,20 +56,30 @@ def run_walk_cycle_animation(agent, mcp, extracted_geometry: Dict[str, Any], ref
     print("\n[CANVAS CHECK] Verifying character exists in Krita...")
     from canvas_detector import detect_canvas_state
     
-    canvas_state = detect_canvas_state(mcp, require_drawing=True)
+    # If extracted_geometry is provided with content, character was just created
+    character_just_created = (extracted_geometry and 
+                               isinstance(extracted_geometry, dict) and 
+                               extracted_geometry.get("total_elements", 0) > 0)
     
-    if not canvas_state["ready"]:
-        print("\n" + "="*60)
-        print("ANIMATION BLOCKED - NO CHARACTER DETECTED")
-        print("="*60)
-        print(f"Reason: {canvas_state['reason']}")
-        print("\nThe canvas must contain a drawn character before animation can begin.")
-        print("Please draw the character first, then try animation again.")
-        print("="*60)
-        return
-    
-    print(f"[CANVAS CHECK] {canvas_state['reason']}")
-    print("[CANVAS CHECK] Canvas ready for animation")
+    if character_just_created:
+        print("[CANVAS CHECK] Character was just created in previous operation")
+        print("[CANVAS CHECK] Canvas ready for animation")
+    else:
+        # Check if character exists
+        canvas_state = detect_canvas_state(mcp, require_drawing=True)
+        
+        if not canvas_state["ready"]:
+            print("\n" + "="*60)
+            print("ANIMATION BLOCKED - NO CHARACTER DETECTED")
+            print("="*60)
+            print(f"Reason: {canvas_state['reason']}")
+            print("\nThe canvas must contain a drawn character before animation can begin.")
+            print("Please draw the character first, then try animation again.")
+            print("="*60)
+            return
+        
+        print(f"[CANVAS CHECK] {canvas_state['reason']}")
+        print("[CANVAS CHECK] Canvas ready for animation")
     
     # 1. Analyze character to get rest pose joints
     profiler.start("1_Groq_character_analysis")

@@ -1,0 +1,164 @@
+===============================================================================
+                    DETECTION FIXED - TEST NOW
+===============================================================================
+
+ROOT CAUSE FIXED:
+  Error: "Unknown tool: 'krita_send_command'"
+  
+  Problem: Detector was calling nonexistent MCP tool
+  
+  Solution: State-based detection
+    - If character just created (extracted_geometry has content) → ALLOWED
+    - Otherwise → Check document/layer → If unclear, BLOCKED
+
+===============================================================================
+                    TEST 1: CREATE → WALK (3 FRAMES)
+===============================================================================
+
+This is the critical flow that must work:
+
+1. Create character from reference
+2. Immediately request walk animation
+3. Request 3 frames
+
+Steps:
+------
+
+1. Start interactive mode:
+   python main.py
+
+2. Select: Create character (option a or b with reference)
+
+3. Provide reference image path:
+   (use your test character reference)
+
+4. Wait for: "Character created!"
+
+5. Select: Animate character
+
+6. Select: Walk cycle
+
+7. Enter frame count: 3
+
+Expected Output:
+----------------
+
+[CANVAS CHECK] Verifying character exists in Krita...
+[CANVAS CHECK] Character was just created in previous operation
+[CANVAS CHECK] Canvas ready for animation
+
+(Animation pipeline proceeds)
+
+Frame 1: Created and drawn
+Frame 2: Created and drawn
+Frame 3: Created and drawn
+
+SUCCESS: All 3 frames contain character drawings
+
+===============================================================================
+                    TEST 2: 20 FRAMES
+===============================================================================
+
+After TEST 1 succeeds:
+
+1. Select: Animate character
+2. Select: Walk cycle
+3. Enter frame count: 20
+
+Expected:
+---------
+
+[CANVAS CHECK] Character was just created
+[CANVAS CHECK] Canvas ready for animation
+
+(Animation proceeds)
+
+20 frames created
+All 20 frames contain drawings
+
+===============================================================================
+                    WHAT WAS FIXED
+===============================================================================
+
+Before (BROKEN):
+  detector calls krita_send_command
+  → "Unknown tool: 'krita_send_command'"
+  → dimensions: 0x0
+  → content bounds: EMPTY
+  → character detected: FALSE
+  → animation BLOCKED (WRONG!)
+
+After (FIXED):
+  extracted_geometry provided
+  → character_just_created: TRUE
+  → canvas ready for animation
+  → animation proceeds (CORRECT!)
+
+===============================================================================
+                    DETECTION LOGIC
+===============================================================================
+
+CASE A: Character Just Created
+  extracted_geometry has content (total_elements > 0)
+  → Character detected: TRUE
+  → Animation: ALLOWED
+
+CASE B: Unknown Canvas State
+  No extracted_geometry or empty
+  → Check document: exists?
+  → Check layer: exists?
+  → Character state: UNKNOWN
+  → Animation: BLOCKED
+
+===============================================================================
+                    NO MORE ERRORS
+===============================================================================
+
+✓ No "Unknown tool: 'krita_send_command'"
+✓ No fake dimensions (0x0)
+✓ No nonexistent MCP tools
+✓ No unreliable pixel sampling
+✓ Simple state-based logic
+
+===============================================================================
+                    SUCCESS CRITERIA
+===============================================================================
+
+Test 1 (3 frames):
+  ✓ Character created successfully
+  ✓ "Character was just created" message
+  ✓ Animation proceeds
+  ✓ 3 frames created
+  ✓ All 3 frames have drawings
+
+Test 2 (20 frames):
+  ✓ Animation proceeds
+  ✓ 20 frames created
+  ✓ All 20 frames have drawings
+
+===============================================================================
+                    IF TEST FAILS
+===============================================================================
+
+If you see:
+  "ANIMATION BLOCKED - NO CHARACTER DETECTED"
+
+But character was just created:
+
+Report:
+  1. Full console output from character creation
+  2. Full console output from animation request
+  3. Whether "Character created!" appeared
+  4. Whether extracted_geometry had content
+
+This would indicate the extracted_geometry is not being passed correctly.
+
+===============================================================================
+                    START TEST
+===============================================================================
+
+Run: python main.py
+
+Then follow TEST 1 steps above.
+
+===============================================================================

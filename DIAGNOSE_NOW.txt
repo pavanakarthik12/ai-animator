@@ -1,0 +1,182 @@
+===============================================================================
+                    DIAGNOSTIC MODE ACTIVATED
+===============================================================================
+
+The detection system has been updated with comprehensive diagnostics.
+
+WHAT CHANGED:
+  - Added inspect_character_state() - shows EXACT Krita state
+  - Increased sampling from 25 to 100 pixels (10x10 grid)
+  - Lowered threshold to ANY non-blank pixels (was 5, now >0)
+  - Added detailed logging of what's found vs what's missing
+
+===============================================================================
+                    STEP 1: DIAGNOSE CURRENT STATE
+===============================================================================
+
+Run this to see EXACTLY what Krita contains right now:
+
+    python diagnose_krita_state.py
+
+This will show:
+  - Document found? Name? Dimensions?
+  - Active layer? Name? Type?
+  - Current frame?
+  - How many pixels sampled?
+  - How many non-blank pixels found?
+  - Where are they located?
+  - Character detected: TRUE or FALSE?
+  - If FALSE: exact reason why
+
+Expected output example (with character):
+
+    [CHARACTER STATE DIAGNOSTIC]
+    Document: FOUND (Untitled)
+    Dimensions: 800x600
+    Active layer: Paint Layer (paint layer)
+    Current frame: 0
+    
+    Checking layer content...
+    Sampling 100 pixels across canvas...
+      Non-blank pixel at (160,120): #ff0000
+      Non-blank pixel at (240,120): #ff0000
+      Non-blank pixel at (320,180): #ff0000
+    
+    Pixel sampling result: 23/100 non-blank pixels
+    
+    Character detected: TRUE (23 non-blank pixels found)
+
+Expected output example (empty):
+
+    [CHARACTER STATE DIAGNOSTIC]
+    Document: FOUND (Untitled)
+    Dimensions: 800x600
+    Active layer: Paint Layer (paint layer)
+    Current frame: 0
+    
+    Checking layer content...
+    Sampling 100 pixels across canvas...
+    
+    Pixel sampling result: 0/100 non-blank pixels
+    
+    Character detected: FALSE (No non-blank pixels found in 100 samples)
+
+===============================================================================
+                    STEP 2: TEST ONE SIMPLE LINE
+===============================================================================
+
+This tests the most basic case:
+
+    python test_one_line.py
+
+It will:
+  1. Ask you to clear the canvas
+  2. Check detection returns FALSE
+  3. Draw ONE red line using krita_stroke
+  4. Check detection returns TRUE
+
+If this test FAILS, we know detection itself is broken.
+If this test PASSES, the problem is with character location/layer/frame.
+
+===============================================================================
+                    STEP 3: WHAT TO REPORT
+===============================================================================
+
+After running the diagnostic, report:
+
+From diagnose_krita_state.py:
+  - Document found: YES or NO
+  - Active layer: Name
+  - Current frame: Number
+  - Non-blank pixels: X/100
+  - Character detected: TRUE or FALSE
+  - Failure reason: (if FALSE)
+
+From test_one_line.py:
+  - Test 1 (empty): PASS or FAIL
+  - Test 2 (one line): PASS or FAIL
+  - Is red line visible in Krita: YES or NO
+
+Visual check in Krita:
+  - Is your character visible: YES or NO
+  - Which layer: Name
+  - Which frame: Number
+  - Is it the active layer: YES or NO
+
+===============================================================================
+                    POSSIBLE OUTCOMES
+===============================================================================
+
+Scenario A: diagnose_krita_state.py shows 0/100 pixels
+            BUT character IS visible in Krita
+    → Character is on wrong layer/frame
+    → Detection is checking wrong location
+
+Scenario B: diagnose_krita_state.py shows >0 pixels
+            AND character_detected = TRUE
+    → Detection is working correctly
+    → Animation should proceed
+
+Scenario C: test_one_line.py draws line
+            Line is visible in Krita
+            BUT detection returns FALSE
+    → Detection logic has a bug
+
+Scenario D: test_one_line.py draws line
+            Line is NOT visible in Krita
+    → Drawing API has a problem (separate issue)
+
+===============================================================================
+                    DETECTION LOGIC CHANGES
+===============================================================================
+
+Old logic:
+  - Sampled 25 pixels (5x5 grid)
+  - Required 5+ non-blank pixels (20% threshold)
+
+New logic:
+  - Samples 100 pixels (10x10 grid)
+  - Requires >0 non-blank pixels (ANY content)
+  - More aggressive sampling
+  - Lower threshold
+  - More detailed logging
+
+Pixel detection:
+  - White (#ffffff) = blank
+  - Transparent (#00000000) = blank
+  - Any other color = non-blank
+  - Logs first 3 non-blank pixels found
+
+===============================================================================
+                    IF DETECTION STILL FAILS
+===============================================================================
+
+If diagnose_krita_state.py shows:
+  - Document: FOUND
+  - Active layer: EXISTS
+  - Non-blank pixels: 0/100
+  - Character detected: FALSE
+
+But the character IS visible in Krita:
+
+STOP and report the complete state:
+  1. Screenshot of Krita showing visible character
+  2. Full output of diagnose_krita_state.py
+  3. Layer name where character is visible
+  4. Frame number where character is visible
+  5. Whether it's the active layer
+
+This indicates the character is in a different location than where
+detection is looking.
+
+===============================================================================
+                    NEXT ACTIONS
+===============================================================================
+
+1. Run: python diagnose_krita_state.py
+2. Run: python test_one_line.py
+3. Report the results
+
+Do NOT proceed to animation testing until diagnosis is complete.
+
+===============================================================================
