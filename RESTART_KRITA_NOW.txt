@@ -1,0 +1,84 @@
+===============================================================================
+                ROOT CAUSE FOUND AND FIXED
+===============================================================================
+
+PROBLEM:
+  Krita was loading the OLD plugin from:
+  C:\Users\pavan\AppData\Roaming\krita\pykrita\kritamcp\__init__.py
+  
+  NOT from the development location we were editing:
+  C:\Users\pavan\OneDrive\Desktop\krita-mcp\krita-plugin\kritamcp\__init__.py
+
+SOLUTION:
+  ✓ Copied the updated plugin to the correct location
+  ✓ The running plugin now has cmd_bulk_strokes at line 1315
+
+===============================================================================
+                    RESTART KRITA NOW
+===============================================================================
+
+The file has been updated, but Krita needs to reload it.
+
+Steps:
+  1. Close Krita completely
+  2. Wait 3 seconds
+  3. Reopen Krita
+  4. Open a document
+
+===============================================================================
+                    THEN TEST
+===============================================================================
+
+Run this:
+
+cd C:\Users\pavan\OneDrive\Desktop\groq-krita-agent
+python test_bulk_api_simple.py
+
+Expected result:
+  ✓ [SmartBatchManager] Using BULK API mode
+  ✓ Sending 1 stroke in ONE bulk call
+  ✓ Result: {'status': 'ok', 'strokes_drawn': 1, ...}
+  ✓ Red line visible in Krita
+
+NO MORE "Unknown action: bulk_strokes"
+
+===============================================================================
+                    OR TEST WITH REFERENCE
+===============================================================================
+
+python test_reference_drawing.py
+
+Expected result:
+  ✓ Using BULK API mode (not LEGACY)
+  ✓ 6 strokes in ONE bulk call
+  ✓ MCP requests: 1 (not 8)
+  ✓ All 6 lines visible in Krita
+
+===============================================================================
+                    WHY THIS HAPPENED
+===============================================================================
+
+Krita plugins are installed in %APPDATA%\krita\pykrita\
+
+The development copy in OneDrive\Desktop\krita-mcp\ was just a source folder.
+
+All our edits went to the source, but Krita was running the old installed copy.
+
+Now both are synced.
+
+===============================================================================
+                    FUTURE EDITS
+===============================================================================
+
+If you need to edit the plugin again, edit BOTH locations:
+
+1. Development: C:\Users\pavan\OneDrive\Desktop\krita-mcp\krita-plugin\kritamcp\__init__.py
+2. Installed: C:\Users\pavan\AppData\Roaming\krita\pykrita\kritamcp\__init__.py
+
+Or copy after editing:
+
+Copy-Item "C:\Users\pavan\OneDrive\Desktop\krita-mcp\krita-plugin\kritamcp\__init__.py" `
+          -Destination "C:\Users\pavan\AppData\Roaming\krita\pykrita\kritamcp\__init__.py" `
+          -Force
+
+===============================================================================

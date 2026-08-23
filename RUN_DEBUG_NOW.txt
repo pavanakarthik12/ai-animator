@@ -1,0 +1,51 @@
+===============================================================================
+                    DEBUG MCP SERVER - RUN THIS NOW
+===============================================================================
+
+This will tell us EXACTLY what's wrong with the bulk API.
+
+Run this command:
+
+cd C:\Users\pavan\OneDrive\Desktop\groq-krita-agent
+python debug_mcp_server.py
+
+===============================================================================
+                    WHAT THIS DOES
+===============================================================================
+
+1. Shows which server.py is being used
+2. Lists ALL available MCP tools
+3. Checks if krita_bulk_strokes is registered
+4. Tests Krita connection
+5. If bulk API exists, tests it with 1 stroke
+6. Provides diagnosis
+
+===============================================================================
+                    POSSIBLE OUTCOMES
+===============================================================================
+
+SCENARIO A: krita_bulk_strokes NOT in tool list
+  → Problem: Tool not registered in server.py
+  → Fix: Add @mcp.tool() decorator or verify server.py
+
+SCENARIO B: krita_bulk_strokes IS in tool list, but returns error
+  → Problem: Krita plugin not restarted or dispatch broken
+  → Fix: Restart Krita
+
+SCENARIO C: krita_bulk_strokes works
+  → Problem solved!
+
+===============================================================================
+                    AFTER RUNNING
+===============================================================================
+
+Share the output, especially:
+
+1. Total tools: X
+2. Tools with 'bulk' in name: (list)
+3. BULK API CHECK: registered or not?
+4. If tested: Result of 1-stroke test
+
+This will tell us the ROOT CAUSE immediately.
+
+===============================================================================

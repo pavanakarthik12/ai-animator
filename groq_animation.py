@@ -1,10 +1,38 @@
 import json
 import base64
 import re
+import hashlib
 from typing import Dict, Any, Tuple, List
 
-def analyze_character_rig(agent, img_path: str) -> Dict[str, Tuple[float, float]]:
-    """Use Groq Vision to extract 2D joint coordinates from the reference image."""
+# Simple cache for expensive Groq API calls
+_character_rig_cache = {}
+_walk_cycle_cache = {}
+
+def clear_animation_cache():
+    """Clear all cached Groq animation results. Useful for testing or if reference changes."""
+    global _character_rig_cache, _walk_cycle_cache
+    _character_rig_cache.clear()
+    _walk_cycle_cache.clear()
+    print("[CACHE] Animation cache cleared")
+
+def _get_file_hash(img_path: str) -> str:
+    """Generate a hash of the image file for cache key."""
+    with open(img_path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+def analyze_character_rig(agent, img_path: str, use_cache: bool = True) -> Dict[str, Tuple[float, float]]:
+    """Use Groq Vision to extract 2D joint coordinates from the reference image.
+    
+    This is called ONCE per animation and results should be cached.
+    Results are cached based on image file hash to avoid redundant API calls.
+    """
+    # Check cache first
+    if use_cache:
+        cache_key = _get_file_hash(img_path)
+        if cache_key in _character_rig_cache:
+            print("[CACHE] Using cached character rig analysis")
+            return _character_rig_cache[cache_key]
+    
     with open(img_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode()
         
@@ -61,6 +89,11 @@ Output ONLY valid JSON in this exact format:
     if match:
         try:
             joints = json.loads(match.group(0))
+            # Cache the result
+            if use_cache:
+                cache_key = _get_file_hash(img_path)
+                _character_rig_cache[cache_key] = joints
+                print(f"[CACHE] Cached character rig analysis (key: {cache_key[:8]})")
             return joints
         except Exception as e:
             print(f"Error parsing joints JSON: {e}")
@@ -70,7 +103,7 @@ Output ONLY valid JSON in this exact format:
             
     # Fallback to hardcoded generic rig if parsing fails
     print("Warning: Failed to extract rig from Groq. Using fallback rig.")
-    return {
+    fallback = {
         "root": [0.5, 0.55],
         "torso": [0.5, 0.35],
         "neck": [0.5, 0.25],
@@ -88,9 +121,22 @@ Output ONLY valid JSON in this exact format:
         "knee_r": [0.55, 0.75],
         "foot_r": [0.55, 0.95]
     }
+    return fallback
 
-def plan_walk_cycle(agent, rest_joints: Dict[str, Tuple[float, float]]) -> List[Dict[str, float]]:
-    """Use Groq Text to generate 5 keyframe poses (Contact, Down, Passing, Up, Contact)."""
+def plan_walk_cycle(agent, rest_joints: Dict[str, Tuple[float, float]], use_cache: bool = True) -> List[Dict[str, float]]:
+    """Use Groq Text to generate 5 keyframe poses (Contact, Down, Passing, Up, Contact).
+    
+    Results are cached since walk cycle planning is deterministic for a given character.
+    """
+    # Check cache first
+    if use_cache:
+        # Create cache key from joint positions (rounded for stability)
+        cache_key = hashlib.md5(
+            json.dumps(sorted(rest_joints.items()), sort_keys=True).encode()
+        ).hexdigest()
+        if cache_key in _walk_cycle_cache:
+            print("[CACHE] Using cached walk cycle plan")
+            return _walk_cycle_cache[cache_key]
     
     prompt = f"""You are a master 2D animator planning a standard 20-frame walk cycle.
 The character is a 2D side-view or 3/4-view character.
@@ -135,6 +181,13 @@ Provide exactly 5 keyframes in the array."""
         try:
             keyframes = json.loads(match.group(0))
             if len(keyframes) == 5:
+                # Cache the result
+                if use_cache:
+                    cache_key = hashlib.md5(
+                        json.dumps(sorted(rest_joints.items()), sort_keys=True).encode()
+                    ).hexdigest()
+                    _walk_cycle_cache[cache_key] = keyframes
+                    print(f"[CACHE] Cached walk cycle plan (key: {cache_key[:8]})")
                 return keyframes
         except Exception as e:
             print(f"Error parsing walk cycle JSON: {e}")
@@ -143,7 +196,7 @@ Provide exactly 5 keyframes in the array."""
         print(f"No JSON found in response. Raw content: {content}")
             
     print("Warning: Failed to extract walk cycle from Groq. Using fallback cycle.")
-    return [
+    fallback = [
         {
             "name": "Contact L",
             "root_y": 0.0,
@@ -175,3 +228,4 @@ Provide exactly 5 keyframes in the array."""
             "hip_l": 0.5, "knee_l": 0.0, "hip_r": -0.5, "knee_r": 0.2
         }
     ]
+    return fallback

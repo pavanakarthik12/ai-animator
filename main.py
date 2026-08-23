@@ -752,8 +752,37 @@ def main():
                                 stats["batches"] += metrics["total_batches_planned"]
                                 stats["mcp_calls"] += metrics["mcp_requests"]
 
-                                strokes_drawn = metrics["total_strokes"]
-                                batch_results = [{"action": "SmartBatchManager.execute_plan", "metrics": metrics}]
+                                # CRITICAL: Check if drawing actually succeeded
+                                # failed_batches > 0 means operation failed
+                                if metrics["failed_batches"] > 0 and metrics["successful_batches"] == 0:
+                                    # Complete failure - no strokes drawn
+                                    strokes_drawn = 0
+                                    batch_results = [{
+                                        "error": "Drawing operation failed",
+                                        "requested": metrics["total_strokes"],
+                                        "drawn": 0,
+                                        "failed": metrics["total_strokes"],
+                                        "metrics": metrics
+                                    }]
+                                elif metrics["successful_batches"] > 0:
+                                    # Success - count the strokes
+                                    strokes_drawn = metrics["total_strokes"]
+                                    batch_results = [{
+                                        "status": "ok",
+                                        "strokes_drawn": strokes_drawn,
+                                        "color": color,
+                                        "brush_size": brush_size,
+                                        "metrics": metrics
+                                    }]
+                                else:
+                                    # Unclear state - assume failure
+                                    strokes_drawn = 0
+                                    batch_results = [{
+                                        "error": "Drawing operation status unclear",
+                                        "requested": metrics["total_strokes"],
+                                        "drawn": 0,
+                                        "metrics": metrics
+                                    }]
 
                                 if truncated:
                                     batch_results.append({
@@ -1024,7 +1053,11 @@ def main():
                 
                 if current_character_path:
                     print("Extracting geometry for walk cycle...")
+                    ref_extraction_start = time.time()
                     extracted = extract_contours_from_image(current_character_path, min_contour_points=3, epsilon_factor=0.002)
+                    ref_extraction_time = time.time() - ref_extraction_start
+                    print(f"[PERF] Reference extraction: {ref_extraction_time:.2f}s")
+                    
                     if extracted['total_elements'] > 0:
                         run_walk_cycle_animation(agent, mcp, extracted, current_character_path, frame_count=frame_count)
                     else:

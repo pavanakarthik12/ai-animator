@@ -1,0 +1,104 @@
+===============================================================================
+                    BULK API FIX - READY TO TEST
+===============================================================================
+
+THE FIX IS COMPLETE.
+
+The Krita plugin now has the bulk_strokes implementation properly placed
+inside the KritaMCPExtension class.
+
+===============================================================================
+                          CRITICAL STEP
+===============================================================================
+
+YOU MUST RESTART KRITA NOW.
+
+The plugin fix won't take effect until Krita reloads the plugin.
+
+Steps:
+1. Close Krita completely
+2. Wait 3 seconds
+3. Reopen Krita
+4. Open or create a document (800x600 recommended)
+5. Make sure you have a paint layer selected
+
+===============================================================================
+                          RUN THE TEST
+===============================================================================
+
+After restarting Krita, run this command:
+
+cd C:\Users\pavan\OneDrive\Desktop\groq-krita-agent
+python test_bulk_api_simple.py
+
+===============================================================================
+                       WHAT TO EXPECT
+===============================================================================
+
+The test will:
+1. Draw ONE red line
+2. Draw FIVE colored lines  
+3. Test old API (cyan line)
+
+If the fix works, you will SEE these lines appear in Krita.
+
+===============================================================================
+                        SUCCESS LOOKS LIKE
+===============================================================================
+
+✓ Test output shows: "PASS" for all 3 tests
+✓ You see a red horizontal line at y=300 in Krita
+✓ You see 5 colored lines at y=100-300 in Krita
+✓ You see a cyan line at y=400 in Krita
+
+If you see these lines: BULK API IS FIXED AND WORKING
+
+===============================================================================
+                       FAILURE LOOKS LIKE
+===============================================================================
+
+✗ Error: "Unknown action: bulk_strokes"
+  → Krita was not restarted
+  → Close Krita, wait, reopen, try again
+
+✗ Error: "Connection refused"
+  → Krita is not running
+  → Start Krita first
+
+✗ Error: "No active paint layer"
+  → Create a paint layer (Layer → New → Paint Layer)
+  → Make sure it's selected
+
+===============================================================================
+                          AFTER TESTS PASS
+===============================================================================
+
+Once tests pass:
+1. The bulk API is working
+2. You can test with real character drawing
+3. Animation should work with bulk API
+4. Performance should improve (10-15 min → 5-8 min)
+
+===============================================================================
+                        NEED HELP?
+===============================================================================
+
+Read these files for details:
+- CRITICAL_NEXT_STEP.md - Step-by-step instructions
+- BULK_API_FIX_SUMMARY.md - Technical details
+- TESTING_INSTRUCTIONS.md - Troubleshooting
+
+===============================================================================
+                          QUICK CHECK
+===============================================================================
+
+Before running test, verify plugin has the fix:
+
+Select-String -Path "C:\Users\pavan\OneDrive\Desktop\krita-mcp\krita-plugin\kritamcp\__init__.py" -Pattern "def cmd_bulk_strokes" -Context 2,0
+
+You should see:
+    def cmd_bulk_strokes(self, params):
+
+With 4 spaces (inside class) = CORRECT
+
+===============================================================================

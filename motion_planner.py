@@ -314,132 +314,363 @@ class MotionPlanner:
     def _generate_walk_pose(self, motion_plan: MotionPlan, frame_num: int) -> Pose:
         """Generate walking pose for specific frame.
         
-        Implements proper walking mechanics:
-        - Alternating legs
-        - Forward progression
-        - Stable foot placement during stance
-        - Arm counter-swing
+        Phase 3.2: Natural Walk Locomotion Fix
+        Implements proper forward locomotion with:
+        - Global root progression (body moves forward continuously)
+        - Local gait cycle (legs alternate relative to moving root)
+        - Proper foot trajectories (planted vs swing)
+        - Weight transfer over support leg
+        - Natural arm counter-swing
+        - Smooth phase transitions
+        
+        KEY FIX: Separate global world movement from local joint movement
         """
         config = motion_plan.metadata.get("walk_config", {})
         frames_per_cycle = config.get("frames_per_cycle", 20)
         
         # Calculate phase within current walk cycle (0.0 to 1.0)
-        phase = ((frame_num - 1) % frames_per_cycle) / frames_per_cycle
+        cycle_progress = ((frame_num - 1) % frames_per_cycle) / frames_per_cycle
         
         # Get character dimensions
         neutral = self.character.neutral_pose
         dimensions = self.character.dimensions
         
         # Calculate leg length
-        leg_length = dimensions.thigh_length + dimensions.shin_length
+        thigh_len = dimensions.thigh_length
+        shin_len = dimensions.shin_length
+        leg_length = thigh_len + shin_len
         if leg_length == 0:
-            leg_length = 100.0  # Fallback
+            leg_length = 100.0
+            thigh_len = 40.0
+            shin_len = 30.0
         
-        # Walk parameters (scaled by leg length)
-        stride = config.get("stride_length_factor", 0.15) * leg_length
-        step_height = config.get("step_height_factor", 0.10) * leg_length
-        body_bob = config.get("body_bob_factor", 0.04) * leg_length
-        arm_swing = config.get("arm_swing_factor", 0.2)
+        # Walk parameters (scaled by character dimensions for natural proportions)
+        stride_length = 0.18 * leg_length  # 18% of leg length - conservative but visible
+        step_height = 0.12 * leg_length     # 12% for visible lift
+        body_bob = 0.04 * leg_length        # 4% subtle bob
+        arm_swing_amplitude = 0.25          # 25% rotation angle
+        hip_sway = 0.06 * (dimensions.torso_width if dimensions.torso_width > 0 else 20)
         
         # Ensure minimum visible movement
-        stride = max(stride, 10.0)  # At least 10 pixels
-        step_height = max(step_height, 5.0)  # At least 5 pixels
+        stride_length = max(stride_length, 12.0)
+        step_height = max(step_height, 6.0)
         
         # Start with neutral pose
         pose = dict(neutral)
         
-        # Calculate body bob (vertical movement)
-        # Contact -> Down -> Passing -> Up -> Contact
-        body_y_offset = math.sin(phase * 4 * math.pi) * body_bob
+        # Get neutral positions
+        root_x_neutral, root_y_neutral = neutral["root"]
+        left_hip_x_neutral, left_hip_y_neutral = neutral["hip_l"]
+        right_hip_x_neutral, right_hip_y_neutral = neutral["hip_r"]
+        ground_y = neutral["foot_l"][1]
         
-        # Calculate foot positions
-        # LEFT LEG: contact (0-0.5), swing (0.5-1.0)
-        # RIGHT LEG: swing (0-0.5), contact (0.5-1.0)
+        # === GLOBAL ROOT PROGRESSION ===
+        # Root moves forward continuously - this is the KEY FIX
+        # Each complete cycle advances by one stride_length
+        cycles_completed = (frame_num - 1) / frames_per_cycle
+        root_x_offset = cycles_completed * stride_length
         
-        left_hip_x, left_hip_y = neutral["hip_l"]
-        right_hip_x, right_hip_y = neutral["hip_r"]
-        left_foot_x_neutral, left_foot_y_neutral = neutral["foot_l"]
-        right_foot_x_neutral, right_foot_y_neutral = neutral["foot_r"]
+        # Within-cycle position (for body bob/sway)
+        root_x = root_x_neutral + root_x_offset
         
-        # Forward direction is +X (right on screen)
-        # Feet move relative to hips with forward progression
+        # === VERTICAL BODY BOB ===
+        # Lowest at double-support (phase 0.0, 0.5), highest at single-support (0.25, 0.75)
+        bob_phase = (cycle_progress * 2) % 1.0
+        body_y_offset = -body_bob * math.cos(bob_phase * 2 * math.pi)
+        root_y = root_y_neutral + body_y_offset
         
-        if phase < 0.5:
-            # Left leg: stance (planted, body moves over it)
-            # Plant foot forward, body catches up
-            left_foot_x = left_hip_x + stride * (1.0 - phase * 2)  # Foot ahead, reduces as body moves over
-            left_foot_y = left_foot_y_neutral  # On ground
-            
-            # Right leg: swing (moving forward)
-            swing_phase = phase / 0.5  # 0 to 1
-            right_foot_x = right_hip_x - stride + (stride * 2) * swing_phase  # Behind to ahead
-            right_foot_y = left_foot_y_neutral - math.sin(swing_phase * math.pi) * step_height  # Arc
+        # === HIP LATERAL WEIGHT SHIFT ===
+        # Shift weight over support leg for natural weight transfer
+        if cycle_progress < 0.5:
+            # Left leg support - shift slightly left
+            shift_progress = self._ease_in_out(cycle_progress / 0.5)
+            hip_shift_x = -hip_sway * shift_progress
         else:
-            # Right leg: stance
-            right_foot_x = right_hip_x + stride * (1.0 - (phase - 0.5) * 2)
-            right_foot_y = right_foot_y_neutral
-            
-            # Left leg: swing
-            swing_phase = (phase - 0.5) / 0.5
-            left_foot_x = left_hip_x - stride + (stride * 2) * swing_phase
-            left_foot_y = left_foot_y_neutral - math.sin(swing_phase * math.pi) * step_height
+            # Right leg support - shift slightly right
+            shift_progress = self._ease_in_out((cycle_progress - 0.5) / 0.5)
+            hip_shift_x = hip_sway * shift_progress
         
-        # Update pose with foot positions
+        # Update hip positions (relative to moving root)
+        left_hip_x = left_hip_x_neutral + root_x_offset + hip_shift_x
+        left_hip_y = left_hip_y_neutral + body_y_offset
+        right_hip_x = right_hip_x_neutral + root_x_offset + hip_shift_x
+        right_hip_y = right_hip_y_neutral + body_y_offset
+        
+        # === FOOT PLACEMENT WITH PROPER GAIT PHASES ===
+        # Left and right legs are phase-shifted by 0.5 (180 degrees)
+        
+        # LEFT LEG CYCLE
+        left_phase = cycle_progress
+        left_foot_x, left_foot_y = self._calculate_foot_position(
+            left_phase,
+            root_x,
+            left_hip_x,
+            left_hip_y,
+            ground_y,
+            stride_length,
+            step_height,
+            is_left=True
+        )
+        
+        # RIGHT LEG CYCLE (phase-shifted by 0.5)
+        right_phase = (cycle_progress + 0.5) % 1.0
+        right_foot_x, right_foot_y = self._calculate_foot_position(
+            right_phase,
+            root_x,
+            right_hip_x,
+            right_hip_y,
+            ground_y,
+            stride_length,
+            step_height,
+            is_left=False
+        )
+        
+        # === IK FOR KNEES ===
+        left_knee_x, left_knee_y = self._solve_two_bone_ik(
+            left_hip_x, left_hip_y,
+            left_foot_x, left_foot_y,
+            thigh_len, shin_len,
+            forward=True
+        )
+        
+        right_knee_x, right_knee_y = self._solve_two_bone_ik(
+            right_hip_x, right_hip_y,
+            right_foot_x, right_foot_y,
+            thigh_len, shin_len,
+            forward=True
+        )
+        
+        # === UPDATE POSE: CORE AND LEGS ===
+        pose["root"] = (root_x, root_y)
+        pose["hip_l"] = (left_hip_x, left_hip_y)
+        pose["hip_r"] = (right_hip_x, right_hip_y)
+        pose["knee_l"] = (left_knee_x, left_knee_y)
+        pose["knee_r"] = (right_knee_x, right_knee_y)
         pose["foot_l"] = (left_foot_x, left_foot_y)
         pose["foot_r"] = (right_foot_x, right_foot_y)
         
-        # Knee positions (IK-style positioning for natural bend)
-        # For simplicity: knees bend between hips and feet
-        left_knee_x = (left_hip_x + left_foot_x) / 2
-        left_knee_y = (left_hip_y + left_foot_y) / 2 - dimensions.shin_length * 0.2  # Slight forward bend
-        
-        right_knee_x = (right_hip_x + right_foot_x) / 2
-        right_knee_y = (right_hip_y + right_foot_y) / 2 - dimensions.shin_length * 0.2
-        
-        pose["knee_l"] = (left_knee_x, left_knee_y)
-        pose["knee_r"] = (right_knee_x, right_knee_y)
-        
-        # Body movement (hips, torso rise with bob)
-        pose["hip_l"] = (left_hip_x, left_hip_y + body_y_offset)
-        pose["hip_r"] = (right_hip_x, right_hip_y + body_y_offset)
-        
-        root_x, root_y = neutral["root"]
-        pose["root"] = (root_x, root_y + body_y_offset)
-        
+        # === TORSO AND HEAD ===
         torso_x, torso_y = neutral["torso"]
-        pose["torso"] = (torso_x, torso_y + body_y_offset)
+        pose["torso"] = (torso_x + root_x_offset + hip_shift_x * 0.5, torso_y + body_y_offset)
         
         neck_x, neck_y = neutral["neck"]
-        pose["neck"] = (neck_x, neck_y + body_y_offset)
-        
         head_x, head_y = neutral["head"]
-        pose["head"] = (head_x, head_y + body_y_offset)
+        # Head stability: only 40% of body bob
+        head_y_offset = body_y_offset * 0.4
+        pose["neck"] = (neck_x + root_x_offset + hip_shift_x * 0.3, neck_y + head_y_offset)
+        pose["head"] = (head_x + root_x_offset + hip_shift_x * 0.3, head_y + head_y_offset)
         
-        # Arm counter-swing
-        # When left leg forward, right arm forward (and vice versa)
-        arm_angle_offset = math.cos(phase * math.pi * 2) * arm_swing * dimensions.upper_arm_length
+        # === ARM COUNTER-SWING ===
+        # Arms swing opposite to legs with timing offset for naturalness
+        # Left arm swings with right leg (opposite)
+        arm_phase = (cycle_progress + 0.15) % 1.0  # 15% lead for natural timing
         
-        # Left arm (moves opposite to left leg)
+        # Calculate arm swing angle using smooth curve
+        arm_angle = math.sin(arm_phase * 2 * math.pi) * arm_swing_amplitude
+        
+        # Left arm
         left_shoulder_x, left_shoulder_y = neutral["shoulder_l"]
-        pose["shoulder_l"] = (left_shoulder_x, left_shoulder_y + body_y_offset)
+        pose["shoulder_l"] = (left_shoulder_x + root_x_offset + hip_shift_x * 0.4, 
+                             left_shoulder_y + body_y_offset)
         
-        left_elbow_x, left_elbow_y = neutral["elbow_l"]
-        pose["elbow_l"] = (left_elbow_x + arm_angle_offset, left_elbow_y + body_y_offset)
+        # Rotate arm from shoulder preserving bone lengths
+        upper_arm_len = dimensions.upper_arm_length
+        forearm_len = dimensions.forearm_length
         
-        left_hand_x, left_hand_y = neutral["hand_l"]
-        pose["hand_l"] = (left_hand_x + arm_angle_offset * 1.2, left_hand_y + body_y_offset)
+        left_elbow_base_x, left_elbow_base_y = neutral["elbow_l"]
+        left_elbow_dx = left_elbow_base_x - left_shoulder_x
+        left_elbow_dy = left_elbow_base_y - left_shoulder_y
+        left_elbow_angle = math.atan2(left_elbow_dy, left_elbow_dx)
+        left_elbow_angle_new = left_elbow_angle + arm_angle
         
-        # Right arm (moves opposite to right leg)
+        shoulder_l_x, shoulder_l_y = pose["shoulder_l"]
+        pose["elbow_l"] = (
+            shoulder_l_x + upper_arm_len * math.cos(left_elbow_angle_new),
+            shoulder_l_y + upper_arm_len * math.sin(left_elbow_angle_new)
+        )
+        
+        # Left hand
+        left_hand_base_x, left_hand_base_y = neutral["hand_l"]
+        left_hand_dx = left_hand_base_x - left_elbow_base_x
+        left_hand_dy = left_hand_base_y - left_elbow_base_y
+        left_hand_angle = math.atan2(left_hand_dy, left_hand_dx)
+        left_hand_angle_new = left_hand_angle + arm_angle * 0.6  # Less swing at hand
+        
+        elbow_l_x, elbow_l_y = pose["elbow_l"]
+        pose["hand_l"] = (
+            elbow_l_x + forearm_len * math.cos(left_hand_angle_new),
+            elbow_l_y + forearm_len * math.sin(left_hand_angle_new)
+        )
+        
+        # Right arm (opposite swing)
         right_shoulder_x, right_shoulder_y = neutral["shoulder_r"]
-        pose["shoulder_r"] = (right_shoulder_x, right_shoulder_y + body_y_offset)
+        pose["shoulder_r"] = (right_shoulder_x + root_x_offset + hip_shift_x * 0.4,
+                             right_shoulder_y + body_y_offset)
         
-        right_elbow_x, right_elbow_y = neutral["elbow_r"]
-        pose["elbow_r"] = (right_elbow_x - arm_angle_offset, right_elbow_y + body_y_offset)
+        right_elbow_base_x, right_elbow_base_y = neutral["elbow_r"]
+        right_elbow_dx = right_elbow_base_x - right_shoulder_x
+        right_elbow_dy = right_elbow_base_y - right_shoulder_y
+        right_elbow_angle = math.atan2(right_elbow_dy, right_elbow_dx)
+        right_elbow_angle_new = right_elbow_angle - arm_angle  # Opposite direction
         
-        right_hand_x, right_hand_y = neutral["hand_r"]
-        pose["hand_r"] = (right_hand_x - arm_angle_offset * 1.2, right_hand_y + body_y_offset)
+        shoulder_r_x, shoulder_r_y = pose["shoulder_r"]
+        pose["elbow_r"] = (
+            shoulder_r_x + upper_arm_len * math.cos(right_elbow_angle_new),
+            shoulder_r_y + upper_arm_len * math.sin(right_elbow_angle_new)
+        )
+        
+        # Right hand
+        right_hand_base_x, right_hand_base_y = neutral["hand_r"]
+        right_hand_dx = right_hand_base_x - right_elbow_base_x
+        right_hand_dy = right_hand_base_y - right_elbow_base_y
+        right_hand_angle = math.atan2(right_hand_dy, right_hand_dx)
+        right_hand_angle_new = right_hand_angle - arm_angle * 0.6
+        
+        elbow_r_x, elbow_r_y = pose["elbow_r"]
+        pose["hand_r"] = (
+            elbow_r_x + forearm_len * math.cos(right_hand_angle_new),
+            elbow_r_y + forearm_len * math.sin(right_hand_angle_new)
+        )
         
         return pose
+    
+    def _calculate_foot_position(self, phase: float, root_x: float, hip_x: float, hip_y: float,
+                                  ground_y: float, stride_length: float, step_height: float,
+                                  is_left: bool) -> tuple:
+        """Calculate foot position for given gait phase.
+        
+        Gait phases:
+        0.0-0.1: CONTACT - foot touches ground ahead
+        0.1-0.3: STANCE - foot planted, body moves over it
+        0.3-0.4: PUSH_OFF - foot pushes, preparing to lift
+        0.4-0.6: SWING - foot lifts and swings forward
+        0.6-0.9: PASSING - foot passes body center, still airborne
+        0.9-1.0: EXTENSION - foot extends toward next contact
+        
+        Args:
+            phase: Gait phase 0.0-1.0
+            root_x: Current root X position (moving forward)
+            hip_x: Current hip X position
+            hip_y: Current hip Y position
+            ground_y: Ground level Y coordinate
+            stride_length: Full stride length
+            step_height: Maximum foot lift height
+            is_left: True for left foot, False for right
+            
+        Returns:
+            (foot_x, foot_y) tuple
+        """
+        # Divide cycle into stance (0.0-0.4) and swing (0.4-1.0)
+        if phase < 0.4:
+            # STANCE PHASE: Foot planted, body moves forward over it
+            # Foot stays relatively fixed in world space while root progresses
+            stance_progress = phase / 0.4  # 0 to 1
+            
+            # Foot planted ahead at start of stance
+            # As body moves forward, foot appears to move backward relative to body
+            foot_x = root_x + stride_length * 0.5 - stride_length * stance_progress
+            foot_y = ground_y
+            
+        else:
+            # SWING PHASE: Foot lifts and swings forward
+            swing_progress = (phase - 0.4) / 0.6  # 0 to 1
+            swing_eased = self._ease_in_out(swing_progress)
+            
+            # Horizontal: foot swings from behind to ahead
+            foot_x = root_x - stride_length * 0.5 + stride_length * swing_eased
+            
+            # Vertical: smooth arc using sine curve
+            # Peak lift at mid-swing (progress = 0.5)
+            lift_curve = math.sin(swing_progress * math.pi)
+            foot_y = ground_y - step_height * lift_curve
+        
+        return (foot_x, foot_y)
+    
+    def _solve_two_bone_ik(self, start_x: float, start_y: float,
+                           end_x: float, end_y: float,
+                           bone1_len: float, bone2_len: float,
+                           forward: bool = True) -> tuple:
+        """Solve 2-bone IK to find middle joint position.
+        
+        Args:
+            start_x, start_y: Start position (e.g., hip)
+            end_x, end_y: End position (e.g., foot)
+            bone1_len: Length of first bone (e.g., thigh)
+            bone2_len: Length of second bone (e.g., shin)
+            forward: If True, knee bends forward; if False, backward
+            
+        Returns:
+            (mid_x, mid_y): Position of middle joint (e.g., knee)
+        """
+        # Distance from start to end
+        dx = end_x - start_x
+        dy = end_y - start_y
+        target_dist = math.hypot(dx, dy)
+        
+        # Check if target is reachable
+        max_reach = bone1_len + bone2_len
+        min_reach = abs(bone1_len - bone2_len)
+        
+        if target_dist > max_reach:
+            # Target too far - clamp to max reach
+            target_dist = max_reach - 0.01  # Slightly less to avoid singularity
+            # Adjust end position
+            scale = target_dist / math.hypot(dx, dy)
+            dx = dx * scale
+            dy = dy * scale
+        elif target_dist < min_reach:
+            # Target too close - use minimum reach
+            target_dist = min_reach + 0.01
+            # Adjust end position
+            if math.hypot(dx, dy) > 0:
+                scale = target_dist / math.hypot(dx, dy)
+                dx = dx * scale
+                dy = dy * scale
+            else:
+                # Degenerate case: start and end are same point
+                dx = target_dist
+                dy = 0
+        
+        # Use law of cosines to find angle at start joint
+        try:
+            # Angle between bone1 and the line from start to end
+            cos_angle = (bone1_len**2 + target_dist**2 - bone2_len**2) / (2 * bone1_len * target_dist)
+            cos_angle = max(-1.0, min(1.0, cos_angle))  # Clamp to valid range
+            angle_offset = math.acos(cos_angle)
+        except (ValueError, ZeroDivisionError):
+            angle_offset = math.pi / 4  # Fallback to 45 degrees
+        
+        # Angle from start to end
+        base_angle = math.atan2(dy, dx)
+        
+        # Determine knee direction
+        # Forward bend means knee is "ahead" of the straight line
+        if forward:
+            mid_angle = base_angle - angle_offset  # Rotate clockwise for forward bend
+        else:
+            mid_angle = base_angle + angle_offset  # Rotate counter-clockwise
+        
+        # Calculate middle joint position
+        mid_x = start_x + bone1_len * math.cos(mid_angle)
+        mid_y = start_y + bone1_len * math.sin(mid_angle)
+        
+        return (mid_x, mid_y)
+    
+    def _ease_in_out(self, t: float) -> float:
+        """Smooth ease-in-out curve.
+        
+        Args:
+            t: Progress from 0.0 to 1.0
+            
+        Returns:
+            Eased value from 0.0 to 1.0
+        """
+        # Cubic ease-in-out
+        if t < 0.5:
+            return 4 * t * t * t
+        else:
+            p = 2 * t - 2
+            return 1 + p * p * p / 2
     
     def _validate_motion_plan(self, motion_plan: MotionPlan):
         """Validate motion plan."""
